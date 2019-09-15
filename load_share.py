@@ -1,4 +1,6 @@
 
+##Version 1.0##
+
 import glob
 import errno
 import ipaddress
@@ -83,7 +85,7 @@ for name in files_CE01:
                         hostname2 = hostname1[10:]
                         hostname3 = hostname2[:-4]
                         hostname4 = hostname2[-4:]
-                        hostname5 = hostname3 + "-" + hostname4
+                        hostname5 = hostname3 + "-" + hostname4 + ".txt"
                         # print(hostname1)
                         # print(hostname2)
                         # print(hostname3)
@@ -170,7 +172,7 @@ with open('load_share_config_template.txt', 'r') as f:
            lines.append(line)
 
 
-with open(hostname5, 'w') as f:
+with open(hostname5, 'w')as f:
    for line in lines:
        f.write(line)
        #print(line)

@@ -5,6 +5,7 @@ import glob
 import errno
 import ipaddress
 from netaddr import IPNetwork
+import os
 
 path_CE01 = 'config/CE01/*.txt'
 path_CE02 = 'config/CE02/*.txt'
@@ -156,29 +157,30 @@ for name in files_ES01:
 with open('load_share_config_template.txt', 'r') as f:
    lines = []
    for line in f:
-       if line.startswith("test"):
+       if line.startswith("mk1"):
            split_line = line.split()
            for ip_list in matching3:
-               split_line.insert(split_line.index("test"), matching3)
+               split_line.insert(split_line.index("mk1"), matching3)
                lines.append(''.join(ip_list))
                #print(ip_list)
-       elif line.startswith("marking_point"):
+       elif line.startswith("mk2"):
            split_line = line.split()
            for ip_list in matching4:
-               split_line.insert(split_line.index("marking_point"), matching4)
+               split_line.insert(split_line.index("mk2"), matching4)
                lines.append(''.join(ip_list))
                #print(ip_list)
        else:
            lines.append(line)
 
 
-with open(hostname5, 'w')as f:
+with open(os.path.join('Output', hostname5), 'w')as f:
    for line in lines:
        f.write(line)
        #print(line)
+#with open(os.path.join('/path/to/Documents',completeName), "w") as file1:
 
 
-with open(hostname5, 'r') as file :
+with open(os.path.join('Output', hostname5), 'r') as file :
   filedata = file.read()
 
 # Replace the target string
@@ -188,6 +190,6 @@ filedata = filedata.replace('interface <CE02 LAN interface>', CE02_interface)
 filedata = filedata.replace('<Last Available IP address of VLAN9>', standby_ip_last)
 
 # Write the file out again
-with open(hostname5, 'w') as file:
+with open(os.path.join('Output', hostname5), 'w') as file:
   file.write(filedata)
 

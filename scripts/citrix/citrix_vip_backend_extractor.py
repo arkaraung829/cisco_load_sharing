@@ -487,7 +487,8 @@ def fetch_gslb_vserver_bindings(pool, vserver):
     }
 
 
-def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=None):
+def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=None,
+                              vserver_state_map=None):
     """
     Fetch ALL CS policy bindings for a CS vserver (not just the first).
 
@@ -497,14 +498,16 @@ def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=No
         action     (from cspolicy)
         target LB  (binding.targetlbvserver, else csaction.targetvserver)
         target vs  (csaction.targetvserver)
+        target LB status (that target LB vserver's UP/DOWN state)
 
-    The four policy columns are folded into one CS row: each column is a
+    The policy columns are folded into one CS row: each column is a
     newline-separated list, aligned so policy N's rule / target LB / action /
-    target vserver share the same line. Uses pre-fetched cspolicy/csaction
-    maps to avoid per-policy API calls.
+    target vserver / target-LB-status share the same line. Uses pre-fetched
+    cspolicy/csaction/vserver-state maps to avoid per-policy API calls.
     """
     cspolicy_map = cspolicy_map or {}
     csaction_map = csaction_map or {}
+    vserver_state_map = vserver_state_map or {}
     vname = csserver.get('name', '')
 
     cs_data = pool.execute(
@@ -521,7 +524,7 @@ def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=No
             return 0
     policy_bindings = sorted(policy_bindings, key=_prio)
 
-    rules, target_lbs, actions, target_vs = [], [], [], []
+    rules, target_lbs, actions, target_vs, target_lb_status = [], [], [], [], []
     for binding in policy_bindings:
         policy_name = binding.get('policyname', '')
         direct_lb = binding.get('targetlbvserver', '')
@@ -549,10 +552,12 @@ def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=No
                 if alist:
                     action_target = alist[0].get('targetlbvserver') or alist[0].get('targetvserver', '')
 
+        this_lb = direct_lb or action_target            # each policy's LB
         rules.append(rule)
-        target_lbs.append(direct_lb or action_target)   # each policy's LB
+        target_lbs.append(this_lb)
         actions.append(action)
         target_vs.append(action_target)
+        target_lb_status.append(vserver_state_map.get(this_lb, '') if this_lb else '')
 
     return {
         'type': 'Content Switching',
@@ -565,6 +570,7 @@ def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=No
         'targetlbvserver': '\n'.join(target_lbs),
         'policy_action': '\n'.join(actions),
         'targetvserver': '\n'.join(target_vs),
+        'targetlbstatus': '\n'.join(target_lb_status),
         'backend_servers': [],
     }
 
@@ -667,6 +673,17 @@ def process_load_balancer(lb_config, ip_ranges):
         print(f"  Found: LB={len(lb_list)}, GSLB={len(gslb_list)}, CS={len(cs_list)}, "
               f"CR={len(cr_list)}, VPN={len(vpn_list)} → Total={total_vs}")
 
+        # Map every vserver name -> its VIP status, so a CS policy's target LB
+        # can be annotated with that LB's UP/DOWN state. LB added last so it
+        # wins any name collision (CS policies target LB vservers).
+        vserver_state_map = {}
+        for vlist in (cr_list, vpn_list, gslb_list, cs_list, lb_list):
+            for v in vlist:
+                name = v.get('name', '')
+                if name:
+                    vserver_state_map[name] = (
+                        v.get('curstate') or v.get('state') or v.get('vsvr_state') or 'N/A')
+
         # ---------------------------------------------------------------
         # PHASE 2: Bulk-fetch lookup tables (3 calls + parallel SG members)
         # This is the KEY optimization — replaces thousands of per-vserver calls
@@ -738,7 +755,8 @@ def process_load_balancer(lb_config, ip_ranges):
 
         with ThreadPoolExecutor(max_workers=BINDING_FETCH_WORKERS) as executor:
             futures = {
-                executor.submit(fetch_cs_vserver_bindings, pool, vs, cspolicy_map, csaction_map): vs
+                executor.submit(fetch_cs_vserver_bindings, pool, vs,
+                                cspolicy_map, csaction_map, vserver_state_map): vs
                 for vs in cs_list
             }
             for future in as_completed(futures):
@@ -847,7 +865,8 @@ def write_csv_streaming(output_file, all_results, global_max_backends):
         for i in range(1, global_max_backends + 1):
             header += [f'BackendName{i}', f'BackendIP{i}', f'BackendHost_FQDN{i}',
                        f'BackendStatus{i}', f'BackendLocation{i}']
-        header += ['Policy Rule', 'Target LB VServer', 'Policy Action', 'Target VServer']
+        header += ['Policy Rule', 'Target LB VServer', 'Policy Action', 'Target VServer',
+                   'Target LB Status']
         writer.writerow(header)
 
         total_rows = 0
@@ -874,7 +893,8 @@ def write_csv_streaming(output_file, all_results, global_max_backends):
                     remaining = global_max_backends - len(info['backend_servers'])
                     row += [''] * (remaining * 5)
                     row += [info['policy_rule'], info['targetlbvserver'],
-                            info['policy_action'], info['targetvserver']]
+                            info['policy_action'], info['targetvserver'],
+                            info.get('targetlbstatus', '')]
                     writer.writerow(row)
                     total_rows += 1
 

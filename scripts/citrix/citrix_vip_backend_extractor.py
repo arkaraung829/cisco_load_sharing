@@ -310,6 +310,37 @@ def bulk_fetch_sg_members(pool, sg_names, server_map):
     return sg_member_map
 
 
+def bulk_fetch_cspolicies(pool):
+    """Fetch ALL cspolicy objects → name→{rule, action} map (one call)."""
+    print(f"  [BULK] Fetching all CS policies...")
+    data = pool.execute("/nitro/v1/config/cspolicy")
+    policies = safe_json_loads(data).get('cspolicy', [])
+    cspolicy_map = {}
+    for p in policies:
+        name = p.get('policyname', '')
+        if name:
+            cspolicy_map[name] = {
+                'rule': p.get('rule', ''),
+                'action': p.get('action', ''),
+            }
+    print(f"  [BULK] Cached {len(cspolicy_map)} CS policies")
+    return cspolicy_map
+
+
+def bulk_fetch_csactions(pool):
+    """Fetch ALL csaction objects → name→target LB vserver map (one call)."""
+    print(f"  [BULK] Fetching all CS actions...")
+    data = pool.execute("/nitro/v1/config/csaction")
+    actions = safe_json_loads(data).get('csaction', [])
+    csaction_map = {}
+    for a in actions:
+        name = a.get('name', '')
+        if name:
+            csaction_map[name] = a.get('targetlbvserver') or a.get('targetvserver', '')
+    print(f"  [BULK] Cached {len(csaction_map)} CS actions")
+    return csaction_map
+
+
 # ===========================================================================
 # Fetch vserver bindings in parallel using cached lookup tables
 # ===========================================================================
@@ -456,10 +487,25 @@ def fetch_gslb_vserver_bindings(pool, vserver):
     }
 
 
-def fetch_cs_vserver_bindings(pool, csserver):
-    """Fetch CS vserver policy bindings."""
+def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=None):
+    """
+    Fetch ALL CS policy bindings for a CS vserver (not just the first).
+
+    Each policy has its own target LB, so we walk every bound policy — sorted
+    by priority — and resolve, per policy:
+        rule       (from cspolicy)
+        action     (from cspolicy)
+        target LB  (binding.targetlbvserver, else csaction.targetvserver)
+        target vs  (csaction.targetvserver)
+
+    The four policy columns are folded into one CS row: each column is a
+    newline-separated list, aligned so policy N's rule / target LB / action /
+    target vserver share the same line. Uses pre-fetched cspolicy/csaction
+    maps to avoid per-policy API calls.
+    """
+    cspolicy_map = cspolicy_map or {}
+    csaction_map = csaction_map or {}
     vname = csserver.get('name', '')
-    policy_rule = targetlbvserver = policy_action = targetvserver = ''
 
     cs_data = pool.execute(
         f"/nitro/v1/config/csvserver_binding/{urllib.parse.quote(vname)}"
@@ -467,21 +513,46 @@ def fetch_cs_vserver_bindings(pool, csserver):
     cs_json = safe_json_loads(cs_data)
     policy_bindings = cs_json.get('csvserver_binding', [{}])[0].get('csvserver_cspolicy_binding', [])
 
-    if policy_bindings:
-        policy = policy_bindings[0]
-        targetlbvserver = policy.get('targetlbvserver', '')
-        policy_name = policy.get('policyname', '')
+    # Sort by priority so the aligned lists read top-to-bottom in bind order
+    def _prio(b):
+        try:
+            return int(b.get('priority', 0))
+        except (TypeError, ValueError):
+            return 0
+    policy_bindings = sorted(policy_bindings, key=_prio)
 
-        cspolicy_data = pool.execute(f"/nitro/v1/config/cspolicy/{urllib.parse.quote(policy_name)}")
-        cspolicy_json = safe_json_loads(cspolicy_data)
-        if 'cspolicy' in cspolicy_json and cspolicy_json['cspolicy']:
-            p = cspolicy_json['cspolicy'][0]
-            policy_rule = p.get('rule', '')
-            policy_action = p.get('action', '')
-            csaction_data = pool.execute(f"/nitro/v1/config/csaction/{urllib.parse.quote(policy_action)}")
-            csaction_json = safe_json_loads(csaction_data)
-            if 'csaction' in csaction_json and csaction_json['csaction']:
-                targetvserver = csaction_json['csaction'][0].get('targetvserver', '')
+    rules, target_lbs, actions, target_vs = [], [], [], []
+    for binding in policy_bindings:
+        policy_name = binding.get('policyname', '')
+        direct_lb = binding.get('targetlbvserver', '')
+
+        # Resolve rule + action from cache (fall back to a single lookup)
+        info = cspolicy_map.get(policy_name)
+        if info is None and policy_name:
+            pj = safe_json_loads(
+                pool.execute(f"/nitro/v1/config/cspolicy/{urllib.parse.quote(policy_name)}"))
+            plist = pj.get('cspolicy', [])
+            info = {'rule': plist[0].get('rule', ''), 'action': plist[0].get('action', '')} if plist else {}
+        info = info or {}
+        rule = info.get('rule', '')
+        action = info.get('action', '')
+
+        # Resolve the action's target from cache (fall back to a single lookup)
+        action_target = ''
+        if action:
+            if action in csaction_map:
+                action_target = csaction_map[action]
+            else:
+                aj = safe_json_loads(
+                    pool.execute(f"/nitro/v1/config/csaction/{urllib.parse.quote(action)}"))
+                alist = aj.get('csaction', [])
+                if alist:
+                    action_target = alist[0].get('targetlbvserver') or alist[0].get('targetvserver', '')
+
+        rules.append(rule)
+        target_lbs.append(direct_lb or action_target)   # each policy's LB
+        actions.append(action)
+        target_vs.append(action_target)
 
     return {
         'type': 'Content Switching',
@@ -490,10 +561,10 @@ def fetch_cs_vserver_bindings(pool, csserver):
         'port': csserver.get('port', 'N/A'),
         'state': csserver.get('curstate', 'N/A'),
         'domains': '',
-        'policy_rule': policy_rule,
-        'targetlbvserver': targetlbvserver,
-        'policy_action': policy_action,
-        'targetvserver': targetvserver,
+        'policy_rule': '\n'.join(rules),
+        'targetlbvserver': '\n'.join(target_lbs),
+        'policy_action': '\n'.join(actions),
+        'targetvserver': '\n'.join(target_vs),
         'backend_servers': [],
     }
 
@@ -607,6 +678,8 @@ def process_load_balancer(lb_config, ip_ranges):
         svc_map = bulk_fetch_services(pool)
         sg_names = bulk_fetch_servicegroups(pool)
         sg_member_map = bulk_fetch_sg_members(pool, sg_names, server_map)
+        cspolicy_map = bulk_fetch_cspolicies(pool)
+        csaction_map = bulk_fetch_csactions(pool)
 
         print(f"  [PHASE 2] Lookup caches built in {time.time() - t2:.1f}s")
 
@@ -665,7 +738,8 @@ def process_load_balancer(lb_config, ip_ranges):
 
         with ThreadPoolExecutor(max_workers=BINDING_FETCH_WORKERS) as executor:
             futures = {
-                executor.submit(fetch_cs_vserver_bindings, pool, vs): vs for vs in cs_list
+                executor.submit(fetch_cs_vserver_bindings, pool, vs, cspolicy_map, csaction_map): vs
+                for vs in cs_list
             }
             for future in as_completed(futures):
                 bindings_info.append(future.result())

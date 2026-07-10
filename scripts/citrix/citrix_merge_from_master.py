@@ -77,16 +77,25 @@ OUTPUT_CSV_FILE = os.path.join(REPORTS_DIR, "combined_load_balancers_MERGED.csv"
 # owner-conflict check below so you can spot genuine ambiguity.
 MATCH_KEY_COLUMNS = ['Virtual Server Name']
 
-# What to do with rows that exist in Master.csv but have NO match in Main
-# (the extractor output).
-#   True  -> also append Master-only rows to the output. With a VPX+Name key
-#            this is VPX-scoped (only VPXs present in Main); with a name-only
-#            key it appends every Master name not in Main (which includes
-#            other datacenters / LBs you didn't extract), so keep it False
-#            unless you specifically want the full Master inventory merged in.
-#   False -> enrich matched rows only; Master-only rows are not added (they
-#            still remain untouched in Master.csv). Output == Main rows.
-APPEND_MASTER_ONLY = False
+# A "Master-only" row is one whose VPX + Virtual Server Name is not in Main.
+# (VPX+Name — not name alone — because a DR copy like KDC-CVL04 + <name> is a
+# distinct row even though its name already matched a HER row for enrichment.)
+APPEND_MATCH_KEYS = ['VPX', 'Virtual Server Name']
+
+# Whether, and how far, to append Master-only rows to the output with their
+# original Master values.
+#   True  -> append Master-only rows, filtered by APPEND_SCOPE below.
+#   False -> don't append; output == Main rows (Master.csv is untouched anyway).
+APPEND_MASTER_ONLY = True
+
+# Scope of the append (only used when APPEND_MASTER_ONLY is True):
+#   'name-in-main' -> append a Master-only row ONLY if its vserver NAME also
+#                     appears in the extract. Brings in the KDC/DR copies of the
+#                     apps you actually scanned, but not unrelated LBs you did
+#                     not scan (e.g. KRSEMNS1-A). RECOMMENDED.
+#   'all'          -> append every Master-only row (full Master inventory,
+#                     including other datacenters and other LBs).
+APPEND_SCOPE = 'name-in-main'
 
 # HA-pair VPX rewriting. OFF by default: in this environment HA pairs span two
 # datacenters with different prefixes (…HER-CVL03 <-> …KDC-CVL04), which the
@@ -382,17 +391,22 @@ def perform_merge(main_df, ref_df):
     log(f"Columns to merge from Master.csv: {ref_cols_available}")
 
     # --- Identify Master-only rows BEFORE subsetting ---
-    # These are VPX+VServer combos in Master but NOT in Main (e.g. partitioned VPXs)
-    main_keys = set(main_df[join_keys].apply(tuple, axis=1))
-    ref_keys = set(ref_df[join_keys].apply(tuple, axis=1))
+    # Master-only is judged by VPX + Virtual Server Name (APPEND_MATCH_KEYS), so
+    # a DR copy (e.g. KDC-CVL04 + <name>) counts as its own row even though its
+    # name already matched a HER row during enrichment.
+    append_keys = [k for k in APPEND_MATCH_KEYS if k in main_df.columns and k in ref_df.columns]
+    if not append_keys:
+        append_keys = list(join_keys)
+    main_keys = set(main_df[append_keys].apply(tuple, axis=1))
+    ref_keys = set(ref_df[append_keys].apply(tuple, axis=1))
     master_only_keys = ref_keys - main_keys
     master_only_count = len(master_only_keys)
 
     if master_only_count > 0:
         log(f"\nMASTER-ONLY ROWS: Found {master_only_count} rows in Master.csv not in Main CSV", "WARNING")
-        # Show first 10 (key is a tuple over join_keys — 1 or 2 elements)
-        vpx_pos = join_keys.index('VPX') if 'VPX' in join_keys else None
-        name_pos = join_keys.index('Virtual Server Name') if 'Virtual Server Name' in join_keys else None
+        # Show first 10 (key is a tuple over append_keys — 1 or 2 elements)
+        vpx_pos = append_keys.index('VPX') if 'VPX' in append_keys else None
+        name_pos = append_keys.index('Virtual Server Name') if 'Virtual Server Name' in append_keys else None
         for i, key in enumerate(sorted(master_only_keys)):
             if i >= 10:
                 log(f"  ... and {master_only_count - 10} more", "WARNING")
@@ -426,10 +440,10 @@ def perform_merge(main_df, ref_df):
     log(f"Unmatched:     {unmatched}")
     if not APPEND_MASTER_ONLY:
         _append_note = "ignored (append OFF)"
-    elif 'VPX' in join_keys:
-        _append_note = "will be appended (VPX-scoped)"
+    elif APPEND_SCOPE == 'name-in-main':
+        _append_note = "will append those whose name is in the extract (DR partners)"
     else:
-        _append_note = "will be appended (all Master-only names)"
+        _append_note = "will append all (full Master inventory)"
     log(f"Master-only:   {master_only_count} ({_append_note})")
     log(f"Match rate:    {(matched / total_main * 100) if total_main > 0 else 0:.2f}%")
 
@@ -458,27 +472,25 @@ def perform_merge(main_df, ref_df):
     merged = merged.drop(columns=['_merge'])
 
     # --- Optionally append Master-only rows (in Master but not in Main) ---
-    # Controlled by APPEND_MASTER_ONLY. When enabled, appends are restricted to
-    # VPXs that are actually present in Main, so a subset run (e.g. one LB)
-    # never drags in vservers from other LBs.
+    # These carry their ORIGINAL Master values (owner/app etc.). Master-only is
+    # by VPX+Name; APPEND_SCOPE decides how far the append reaches.
     if APPEND_MASTER_ONLY and master_only_count > 0:
-        base_mask = ref_df[join_keys].apply(tuple, axis=1).isin(master_only_keys)
-        # VPX-scope the append only when VPX is part of the join key; with a
-        # name-only key there is no VPX scope, so append every Master-only name.
-        if 'VPX' in join_keys and 'VPX' in ref_df.columns:
-            main_vpxs = set(main_df['VPX'].unique())
-            master_only_mask = base_mask & ref_df['VPX'].isin(main_vpxs)
-        else:
+        base_mask = ref_df[append_keys].apply(tuple, axis=1).isin(master_only_keys)
+        if APPEND_SCOPE == 'name-in-main':
+            # DR partners only: the name must also appear in the extract.
+            main_names = set(main_df['Virtual Server Name'])
+            master_only_mask = base_mask & ref_df['Virtual Server Name'].isin(main_names)
+        else:  # 'all'
             master_only_mask = base_mask
         master_only_rows = ref_df[master_only_mask].copy()
 
-        skipped_other_vpx = master_only_count - len(master_only_rows)
-        if skipped_other_vpx > 0:
-            log(f"Skipping {skipped_other_vpx} Master-only rows on VPXs not in Main "
-                f"(subset run — other LBs not dragged in)", "WARNING")
+        skipped = master_only_count - len(master_only_rows)
+        if skipped > 0 and APPEND_SCOPE == 'name-in-main':
+            log(f"Skipping {skipped} Master-only rows whose name is NOT in the "
+                f"extract (unrelated LBs not dragged in)", "WARNING")
 
         if master_only_rows.empty:
-            log("No Master-only rows to append for the VPXs present in Main", "SUCCESS")
+            log("No Master-only rows to append under the current APPEND_SCOPE", "SUCCESS")
 
         # Separate partition vs non-partition for logging
         partition_mask = master_only_rows['VPX'].str.contains(' - ', na=False)
@@ -679,8 +691,13 @@ def main():
 
     log(f"\nMain CSV rows:   {len(main_df)}")
     log(f"Output rows:     {len(merged_df)}")
-    if len(main_df) != len(merged_df):
-        log("WARNING: Row count mismatch! Check for duplicate keys.", "WARNING")
+    delta = len(merged_df) - len(main_df)
+    if delta > 0 and APPEND_MASTER_ONLY:
+        log(f"Output has {delta} more rows than Main — appended Master-only rows "
+            f"(APPEND_MASTER_ONLY on). Expected.", "SUCCESS")
+    elif len(main_df) != len(merged_df):
+        log(f"WARNING: Row count off by {delta} and append is not the cause — "
+            f"check for duplicate keys.", "WARNING")
     else:
         log("Row count matches - no data loss", "SUCCESS")
 

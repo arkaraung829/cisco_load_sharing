@@ -2,23 +2,13 @@
 """
 citrix_merge_diagnose.py  —  READ-ONLY diagnostic for the master merge.
 
-Answers: "why are Contact / Status (and other owner columns) blank in the
-merged output when Master.csv has them?"
+Answers: "why are Owner Group / Contact / Status blank in the merged output
+when Master.csv has them?"
 
 It compares Main (combined_load_balancers) against Master.csv WITHOUT writing
-anything, and reports:
-  1. Which owner columns actually exist in each file.
-  2. How VPX values compare between the two files (the usual culprit after
-     switching the join to VPX + Virtual Server Name).
-  3. Match rates under three key strategies:
-        exact  VPX + Virtual Server Name   (what the merge uses now)
-        norm   VPX + Name, whitespace/case-normalized
-        name   Virtual Server Name only    (the old behavior)
-  4. Of Master rows that HAVE owner data, how many actually reach a Main row
-     under each strategy.
-  5. Concrete examples of Master rows that have Contact/Status but fail the
-     exact VPX+Name match — showing the VPX on each side so you can see the
-     mismatch.
+anything, applying the SAME HA-pair VPX normalization the merge uses, and
+classifies every Main row's enrichment outcome so you can see exactly where
+matching breaks (VPX vs Virtual Server Name vs genuinely-empty Master cell).
 
 Usage:
     python citrix_merge_diagnose.py [main.csv] [master.csv]
@@ -56,14 +46,39 @@ REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports", "citrix")
 DEFAULT_MAIN = os.path.join(REPORTS_DIR, "combined_load_balancers 1.csv")
 DEFAULT_MASTER = os.path.join(SCRIPT_DIR, "Master.csv")
 
-KEY = ['VPX', 'Virtual Server Name']
 OWNER_COLS = [
     'Owner Group', 'Contact', 'Status', 'Change Date', 'Change Record',
     'PPS Family', 'Support', 'Tech Lead', 'PM', 'PPS Lead', 'VP', 'Application',
     'Redundancy',
 ]
-# Columns whose blanks in the screenshot prompted this check
-FOCUS_COLS = ['Contact', 'Status']
+FOCUS_COLS = ['Owner Group', 'Contact', 'Status']  # what you're seeing blank
+
+# ---- Reuse the merge's HA-pair logic so this mirrors the real merge ----
+try:
+    _spec = importlib.util.spec_from_file_location(
+        "citrix_merge_from_master",
+        os.path.join(SCRIPT_DIR, "citrix_merge_from_master.py"))
+    _merge = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_merge)
+    canonical_vpx = _merge.canonical_vpx
+    NORMALIZE_VPX_HA_PAIRS = _merge.NORMALIZE_VPX_HA_PAIRS
+    print("[INFO] Using HA-pair logic imported from citrix_merge_from_master.py")
+except Exception as e:  # standalone fallback (kept in sync with the merge)
+    print(f"[WARN] Could not import merge module ({e}); using built-in pairing")
+    import re
+    NORMALIZE_VPX_HA_PAIRS = True
+    _VPX_CVL_RE = re.compile(r'(?i)^(?P<prefix>.*?CVL)(?P<n1>\d+)(?:\s*/\s*\d+)?(?P<rest>.*)$')
+
+    def canonical_vpx(value):
+        if not value:
+            return value
+        m = _VPX_CVL_RE.match(value.strip())
+        if not m:
+            return value
+        n1 = m.group('n1'); num = int(n1)
+        base = num if num % 2 == 1 else num - 1
+        width = max(2, len(n1))
+        return f"{m.group('prefix')}{base:0{width}d}/{base + 1:0{width}d}{m.group('rest') or ''}"
 
 
 def detect_encoding(path):
@@ -98,14 +113,14 @@ def load(path, label):
     return df
 
 
-def norm_series(s):
-    return s.str.strip().str.upper()
-
-
 def hr(title):
     print("\n" + "=" * 78)
     print(title)
     print("=" * 78)
+
+
+def pair(v):
+    return canonical_vpx(v) if NORMALIZE_VPX_HA_PAIRS else v
 
 
 def main():
@@ -116,137 +131,127 @@ def main():
     main_df = load(main_path, "Main   ")
     ref_df = load(master_path, "Master ")
 
-    # ---- 1. Columns present ----
-    hr("1. OWNER COLUMNS PRESENT")
+    for key in ['VPX', 'Virtual Server Name']:
+        if key not in main_df.columns:
+            print(f"[ERROR] Main is missing '{key}'"); return
+        if key not in ref_df.columns:
+            print(f"[ERROR] Master is missing '{key}'"); return
+
+    # ---- 1. Owner columns present? ----
+    hr("1. OWNER COLUMNS — present, and non-blank count in Master")
     for c in OWNER_COLS:
         in_main = "yes" if c in main_df.columns else "NO"
         in_ref = "yes" if c in ref_df.columns else "NO"
-        nonblank_ref = (ref_df[c].astype(str).str.strip() != '').sum() if c in ref_df.columns else 0
-        print(f"  {c:<16} Main:{in_main:<4} Master:{in_ref:<4} "
-              f"Master non-blank: {nonblank_ref:,}")
+        nonblank = (ref_df[c].str.strip() != '').sum() if c in ref_df.columns else 0
+        print(f"  {c:<16} Main:{in_main:<4} Master:{in_ref:<4} Master non-blank: {nonblank:,}")
+    missing_in_ref = [c for c in FOCUS_COLS if c not in ref_df.columns]
+    if missing_in_ref:
+        print(f"\n  [!] Master.csv has NO column named {missing_in_ref} — exact header "
+              f"text must match. That alone would explain the blanks.")
 
-    for key in KEY:
-        if key not in main_df.columns:
-            print(f"\n[ERROR] Main is missing join column '{key}' — cannot match.")
-            return
-        if key not in ref_df.columns:
-            print(f"\n[ERROR] Master is missing join column '{key}' — cannot match.")
-            return
+    # ---- 2. VPX after HA pairing ----
+    hr("2. VPX AFTER HA PAIRING — Main vs Master")
+    main_vpx_p = main_df['VPX'].map(pair)
+    ref_vpx_p = ref_df['VPX'].map(pair)
+    mset, rset = set(main_vpx_p.unique()), set(ref_vpx_p.unique())
+    print(f"  Distinct paired VPX in Main   ({len(mset)}): {sorted(mset)[:8]}")
+    print(f"  Distinct paired VPX in Master ({len(rset)}): {sorted(rset)[:8]}")
+    print(f"  Paired VPX present in BOTH    : {len(mset & rset)}")
+    only_m = sorted(mset - rset); only_r = sorted(rset - mset)
+    if only_m:
+        print(f"  Paired VPX only in Main   : {only_m[:10]}")
+    if only_r:
+        print(f"  Paired VPX only in Master : {only_r[:10]}")
 
-    # ---- 2. VPX comparison ----
-    hr("2. VPX VALUES — Main vs Master")
-    main_vpx = set(main_df['VPX'].unique())
-    ref_vpx = set(ref_df['VPX'].unique())
-    print(f"  Distinct VPX in Main   : {len(main_vpx)}")
-    print(f"  Distinct VPX in Master : {len(ref_vpx)}")
-    common = sorted(main_vpx & ref_vpx)
-    only_main = sorted(main_vpx - ref_vpx)
-    only_ref = sorted(ref_vpx - main_vpx)
-    print(f"  Exactly matching VPX values : {len(common)}")
-    if common:
-        print("    e.g. " + ", ".join(repr(v) for v in common[:5]))
-    print(f"  VPX only in Main   : {len(only_main)}")
-    for v in only_main[:10]:
-        print(f"      {v!r}")
-    print(f"  VPX only in Master : {len(only_ref)}")
-    for v in only_ref[:10]:
-        print(f"      {v!r}")
-    # Normalized VPX overlap (catches case/space diffs)
-    norm_main_vpx = set(norm_series(main_df['VPX']).unique())
-    norm_ref_vpx = set(norm_series(ref_df['VPX']).unique())
-    print(f"  After strip+UPPER, matching VPX values : {len(norm_main_vpx & norm_ref_vpx)}")
-
-    # ---- 3. Match rates under each strategy ----
-    hr("3. MATCH RATE — how many Main rows find a Master row")
-    total_main = len(main_df)
-
-    main_key_exact = list(zip(main_df['VPX'], main_df['Virtual Server Name']))
-    ref_key_exact = set(zip(ref_df['VPX'], ref_df['Virtual Server Name']))
-    exact_hits = sum(1 for k in main_key_exact if k in ref_key_exact)
-
-    main_key_norm = list(zip(norm_series(main_df['VPX']), norm_series(main_df['Virtual Server Name'])))
-    ref_key_norm = set(zip(norm_series(ref_df['VPX']), norm_series(ref_df['Virtual Server Name'])))
-    norm_hits = sum(1 for k in main_key_norm if k in ref_key_norm)
-
+    # ---- 3. Match rate under paired VPX + Name ----
+    hr("3. MATCH RATE (paired VPX + Virtual Server Name)")
+    main_key = list(zip(main_vpx_p, main_df['Virtual Server Name']))
+    ref_key = set(zip(ref_vpx_p, ref_df['Virtual Server Name']))
+    hits = sum(1 for k in main_key if k in ref_key)
+    tot = len(main_df)
+    print(f"  Main rows                : {tot:,}")
+    print(f"  Match on paired VPX+Name : {hits:,} ({hits / tot * 100:.1f}%)" if tot else "  (empty)")
+    # name-only, to see if VPX is the blocker
     ref_names = set(ref_df['Virtual Server Name'])
     name_hits = main_df['Virtual Server Name'].isin(ref_names).sum()
+    print(f"  Match on Name only       : {name_hits:,} ({name_hits / tot * 100:.1f}%)" if tot else "")
+    if name_hits > hits:
+        print(f"  >> {name_hits - hits:,} rows match by NAME but not by paired VPX "
+              f"-> VPX still differs for these (check section 2 / add VPX_PAIR_OVERRIDES).")
 
-    # Is the vserver name actually unique within Master? (decides if name-only is safe)
-    name_counts = ref_df['Virtual Server Name'].value_counts()
-    dup_names = (name_counts > 1).sum()
-
-    def pct(n):
-        return f"{n:,} ({n / total_main * 100:.1f}%)" if total_main else "0"
-
-    print(f"  Main rows                          : {total_main:,}")
-    print(f"  Matched on exact VPX + Name (now)  : {pct(exact_hits)}")
-    print(f"  Matched on strip+UPPER VPX + Name  : {pct(norm_hits)}")
-    print(f"  Matched on Virtual Server Name only: {pct(name_hits)}")
-    print(f"  Vserver names duplicated in Master : {dup_names} "
-          f"(if 0, name-only matching is unambiguous)")
-
-    # ---- 4. Reachability of Master owner data ----
-    hr("4. MASTER ROWS THAT HAVE OWNER DATA — do they reach Main?")
-    have_owner = ref_df[[c for c in OWNER_COLS if c in ref_df.columns]].apply(
-        lambda r: any(str(x).strip() for x in r), axis=1)
-    ref_with = ref_df[have_owner]
-    print(f"  Master rows with any owner value   : {len(ref_with):,}")
-    rexact = set(zip(main_df['VPX'], main_df['Virtual Server Name']))
-    reach_exact = ref_with.apply(
-        lambda r: (r['VPX'], r['Virtual Server Name']) in rexact, axis=1).sum()
-    rnorm = set(zip(norm_series(main_df['VPX']), norm_series(main_df['Virtual Server Name'])))
-    reach_norm = ref_with.apply(
-        lambda r: (str(r['VPX']).strip().upper(),
-                   str(r['Virtual Server Name']).strip().upper()) in rnorm, axis=1).sum()
-    main_names = set(main_df['Virtual Server Name'])
-    reach_name = ref_with['Virtual Server Name'].isin(main_names).sum()
-    print(f"    reach Main via exact VPX+Name    : {reach_exact:,}")
-    print(f"    reach Main via norm  VPX+Name    : {reach_norm:,}")
-    print(f"    reach Main via Name only         : {reach_name:,}")
-    gained = reach_name - reach_exact
-    if gained > 0:
-        print(f"  >> {gained:,} owner rows are LOST by exact VPX+Name that "
-              f"name-only would have matched.")
-
-    # ---- 5. Concrete failing examples ----
-    hr("5. EXAMPLES — Master rows WITH Contact/Status that FAIL exact VPX+Name")
+    # ---- 4. WHY each Main row is (not) enriched ----
+    hr("4. WHY MAIN ROWS ARE BLANK — classification of every Main row")
     focus = [c for c in FOCUS_COLS if c in ref_df.columns]
-    if not focus:
-        print("  (Neither Contact nor Status exists as a column in Master.csv — "
-              "that alone would explain blanks. Check the exact header text.)")
-    else:
-        has_focus = ref_df[focus].apply(
-            lambda r: any(str(x).strip() for x in r), axis=1)
-        cand = ref_df[has_focus].copy()
-        cand['_exact'] = cand.apply(
-            lambda r: (r['VPX'], r['Virtual Server Name']) in rexact, axis=1)
-        failing = cand[~cand['_exact']]
-        print(f"  Master rows with {focus} filled : {len(cand):,}")
-        print(f"  ...of those, FAIL exact VPX+Name : {len(failing):,}")
-        # For a few, show whether the NAME exists in Main and under which VPX
-        main_by_name = main_df.groupby('Virtual Server Name')['VPX'].apply(
-            lambda s: sorted(set(s))).to_dict()
-        shown = 0
-        for _, r in failing.iterrows():
-            if shown >= 15:
-                print(f"  ... and {len(failing) - 15} more")
-                break
-            name = r['Virtual Server Name']
-            main_vpxs = main_by_name.get(name)
-            if main_vpxs is None:
-                where = "name NOT in Main at all"
-            else:
-                where = f"Main has this name under VPX {main_vpxs}"
-            contact = (r.get('Contact', '') or '')[:22]
-            print(f"    Master VPX={r['VPX']!r} Name={name!r} Contact={contact!r}")
-            print(f"        -> {where}")
-            shown += 1
-        if len(failing) == 0:
-            print("  None — exact VPX+Name matches every owner-bearing row. "
-                  "Blanks you see are likely genuinely-empty Master cells or "
-                  "truly Main-only vservers.")
+    # Master lookup: (pairedVPX, name) -> does it have any focus value?
+    ref_lookup = {}
+    for _, r in ref_df.iterrows():
+        k = (pair(r['VPX']), r['Virtual Server Name'])
+        has_val = any(str(r.get(c, '')).strip() for c in focus) if focus else False
+        # keep True if any dup has a value
+        ref_lookup[k] = ref_lookup.get(k, False) or has_val
+    name_to_pairedvpx = {}
+    for _, r in ref_df.iterrows():
+        name_to_pairedvpx.setdefault(r['Virtual Server Name'], set()).add(pair(r['VPX']))
 
-    hr("DONE — read-only, nothing was written")
+    cnt = {"matched_with_data": 0, "matched_master_blank": 0,
+           "name_diff_vpx": 0, "name_absent": 0}
+    examples = {"matched_master_blank": [], "name_diff_vpx": [], "name_absent": []}
+    for i in range(len(main_df)):
+        pvpx = main_key[i][0]
+        name = main_df.iloc[i]['Virtual Server Name']
+        k = (pvpx, name)
+        if k in ref_lookup:
+            if ref_lookup[k]:
+                cnt["matched_with_data"] += 1
+            else:
+                cnt["matched_master_blank"] += 1
+                if len(examples["matched_master_blank"]) < 8:
+                    examples["matched_master_blank"].append((pvpx, name))
+        elif name in name_to_pairedvpx:
+            cnt["name_diff_vpx"] += 1
+            if len(examples["name_diff_vpx"]) < 8:
+                examples["name_diff_vpx"].append(
+                    (pvpx, name, sorted(name_to_pairedvpx[name])))
+        else:
+            cnt["name_absent"] += 1
+            if len(examples["name_absent"]) < 8:
+                examples["name_absent"].append((pvpx, name))
+
+    print(f"  MATCHED, Master has data   : {cnt['matched_with_data']:,}   "
+          f"(these SHOULD be enriched)")
+    print(f"  MATCHED, Master cell blank : {cnt['matched_master_blank']:,}   "
+          f"(blank because Master itself is empty)")
+    print(f"  NAME in Master, VPX differs: {cnt['name_diff_vpx']:,}   "
+          f"(VPX pairing still off — fixable)")
+    print(f"  NAME not in Master at all  : {cnt['name_absent']:,}   "
+          f"(genuinely Main-only; blank is correct)")
+
+    if examples["name_diff_vpx"]:
+        print("\n  --- Examples: name matches but VPX differs (THE fixable ones) ---")
+        for pvpx, name, rvpxs in examples["name_diff_vpx"]:
+            print(f"    Main pairedVPX={pvpx!r}  Name={name!r}")
+            print(f"        Master has this name under pairedVPX {rvpxs}")
+    if examples["name_absent"]:
+        print("\n  --- Examples: name not found in Master (blank is expected) ---")
+        for pvpx, name in examples["name_absent"]:
+            print(f"    Main pairedVPX={pvpx!r}  Name={name!r}")
+    if examples["matched_master_blank"]:
+        print("\n  --- Examples: matched, but Master's own cell is empty ---")
+        for pvpx, name in examples["matched_master_blank"]:
+            print(f"    pairedVPX={pvpx!r}  Name={name!r}")
+
+    hr("SUMMARY")
+    if cnt["matched_with_data"] == 0:
+        print("  0 rows matched with Master data. If section 3 shows Name-only")
+        print("  matches > paired matches, the VPX labels still differ — compare the")
+        print("  two VPX lists in section 2. If Name-only is ALSO ~0, the Virtual")
+        print("  Server Name text differs between the files (suffixes/case), or you")
+        print("  are viewing the raw extractor file instead of *_MERGED.csv.")
+    else:
+        print(f"  {cnt['matched_with_data']:,} Main rows should show Master data after a")
+        print("  fresh merge. If your open file doesn't, re-run citrix_merge_from_master.py")
+        print("  and open combined_load_balancers_MERGED.csv (VPX will read '.../CVLxx/yy').")
+    print("\n  (read-only — nothing was written)")
 
 
 if __name__ == "__main__":

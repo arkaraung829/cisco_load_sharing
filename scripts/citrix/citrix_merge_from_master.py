@@ -63,27 +63,36 @@ REFERENCE_CSV_FILE = os.path.join(SCRIPT_DIR, "Master.csv")
 OUTPUT_CSV_FILE = os.path.join(REPORTS_DIR, "combined_load_balancers_MERGED.csv")
 
 # Matching key columns (used to join main + reference)
-# VPX + Virtual Server Name identifies a vserver uniquely, even when the same
-# vserver name exists on more than one VPX.
-MATCH_KEY_COLUMNS = ['VPX', 'Virtual Server Name']
+#
+# Owner/app data is keyed by the VSERVER NAME, which is the application's
+# identity. The same vserver is deployed across HA/DR datacenters under
+# DIFFERENT VPX names — the extractor connects to one node (e.g.
+# LCLDMZHER-CVL03) while the Master sheet records the partner node in the
+# other datacenter (e.g. LCLDMZKDC-CVL04). Those VPX strings don't match, so
+# joining on VPX drops the enrichment (measured: 89.5% vs 99.9% on name).
+# Therefore match on Virtual Server Name only.
+#
+# Safety: a few vserver names appear under multiple Master rows. They resolve
+# to the same owner (same app in two DCs); any that DON'T are reported by the
+# owner-conflict check below so you can spot genuine ambiguity.
+MATCH_KEY_COLUMNS = ['Virtual Server Name']
 
 # What to do with rows that exist in Master.csv but have NO match in Main
-# (the extractor output). This matters when Main was generated for only some
-# LBs, not all of them.
-#   True  -> keep Master-only rows in the output so their master values
-#            (owner/app) remain visible, but ONLY for VPXs present in Main
-#            (so other LBs are never dragged in). Safe for single-LB runs.
-#   False -> enrich matched rows only; drop Master-only rows from the output
-#            (they still remain untouched in Master.csv). Output == Main rows.
-APPEND_MASTER_ONLY = True
+# (the extractor output).
+#   True  -> also append Master-only rows to the output. With a VPX+Name key
+#            this is VPX-scoped (only VPXs present in Main); with a name-only
+#            key it appends every Master name not in Main (which includes
+#            other datacenters / LBs you didn't extract), so keep it False
+#            unless you specifically want the full Master inventory merged in.
+#   False -> enrich matched rows only; Master-only rows are not added (they
+#            still remain untouched in Master.csv). Output == Main rows.
+APPEND_MASTER_ONLY = False
 
-# ADCs are deployed as HA pairs (…CVL01/02, …CVL03/04, …CVL05/06). The
-# extractor records whichever single node it connected to (e.g. …CVL03), but
-# the Master sheet may record the pair or the other node (…CVL04). When True,
-# every VPX is rewritten to its pair label (…CVL03/04) on BOTH files BEFORE
-# matching, so enrichment lands regardless of which node each file recorded,
-# and the merged output shows the unambiguous pair label.
-NORMALIZE_VPX_HA_PAIRS = True
+# HA-pair VPX rewriting. OFF by default: in this environment HA pairs span two
+# datacenters with different prefixes (…HER-CVL03 <-> …KDC-CVL04), which the
+# simple same-prefix odd/even pairing below does NOT bridge, and matching is
+# done on name anyway. Kept for reference / other environments.
+NORMALIZE_VPX_HA_PAIRS = False
 
 # Exceptions to the automatic odd/even pairing, if any node doesn't follow the
 # consecutive CVL<odd>/<even> rule. Map an exact VPX value -> desired label.
@@ -116,6 +125,36 @@ def canonical_vpx(value):
     base = num if num % 2 == 1 else num - 1        # odd node is the pair base
     width = max(2, len(n1))                          # preserve zero-padding
     return f"{m.group('prefix')}{base:0{width}d}/{base + 1:0{width}d}{m.group('rest') or ''}"
+
+
+def report_owner_conflicts(ref_df, name_col='Virtual Server Name', owner_col='Owner Group'):
+    """
+    With a name-only join, a vserver name that appears under several Master
+    rows resolves to ONE owner (keep='last'). Warn if any name carries more
+    than one distinct non-blank owner, so genuine ambiguity is visible rather
+    than silently resolved.
+    """
+    if name_col not in ref_df.columns or owner_col not in ref_df.columns:
+        return
+    sub = ref_df[[name_col, owner_col]].copy()
+    sub = sub[sub[owner_col].str.strip() != '']
+    if sub.empty:
+        return
+    distinct = sub.groupby(name_col)[owner_col].nunique()
+    conflicts = distinct[distinct > 1]
+    if len(conflicts) == 0:
+        log(f"Owner-conflict check: OK — every duplicated vserver name agrees "
+            f"on '{owner_col}'", "SUCCESS")
+        return
+    log(f"Owner-conflict check: {len(conflicts)} vserver name(s) have MORE THAN "
+        f"ONE distinct '{owner_col}' in Master; name-only match keeps the last. "
+        f"Review these:", "WARNING")
+    for name in list(conflicts.index)[:15]:
+        vals = sorted(sub[sub[name_col] == name][owner_col].unique())
+        log(f"  {name!r}: {vals}", "WARNING")
+    if len(conflicts) > 15:
+        log(f"  ... and {len(conflicts) - 15} more", "WARNING")
+
 
 # Column name mapping: Master.csv name -> Main CSV name (rename before merge)
 # No rename needed — both files now use the same column names
@@ -312,6 +351,9 @@ def perform_merge(main_df, ref_df):
         log(f"Distinct VPX after pairing — Main: {sorted(main_df['VPX'].unique())[:8]}")
         log(f"Distinct VPX after pairing — Master: {sorted(ref_df['VPX'].unique())[:8]}")
 
+    # Flag any vserver name whose Master rows disagree on owner (name-only join)
+    report_owner_conflicts(ref_df)
+
     # Rename Master.csv columns to match Main CSV names
     rename_applied = {k: v for k, v in COLUMN_RENAME_MAP.items() if k in ref_df.columns}
     if rename_applied:
@@ -348,12 +390,16 @@ def perform_merge(main_df, ref_df):
 
     if master_only_count > 0:
         log(f"\nMASTER-ONLY ROWS: Found {master_only_count} rows in Master.csv not in Main CSV", "WARNING")
-        # Show first 10
+        # Show first 10 (key is a tuple over join_keys — 1 or 2 elements)
+        vpx_pos = join_keys.index('VPX') if 'VPX' in join_keys else None
+        name_pos = join_keys.index('Virtual Server Name') if 'Virtual Server Name' in join_keys else None
         for i, key in enumerate(sorted(master_only_keys)):
             if i >= 10:
                 log(f"  ... and {master_only_count - 10} more", "WARNING")
                 break
-            log(f"  NEW: VPX='{key[0]}', VServer='{key[1]}'", "WARNING")
+            vpx = key[vpx_pos] if vpx_pos is not None else ''
+            name = key[name_pos] if name_pos is not None else key[0]
+            log(f"  NEW: VPX='{vpx}', VServer='{name}'", "WARNING")
 
     # Prepare reference subset for matched rows: join keys + update columns
     ref_subset = ref_df[join_keys + ref_cols_available].copy()
@@ -378,7 +424,12 @@ def perform_merge(main_df, ref_df):
     log(f"Main rows:     {total_main}")
     log(f"Matched:       {matched}")
     log(f"Unmatched:     {unmatched}")
-    _append_note = "will be appended (VPX-scoped)" if APPEND_MASTER_ONLY else "ignored (append OFF)"
+    if not APPEND_MASTER_ONLY:
+        _append_note = "ignored (append OFF)"
+    elif 'VPX' in join_keys:
+        _append_note = "will be appended (VPX-scoped)"
+    else:
+        _append_note = "will be appended (all Master-only names)"
     log(f"Master-only:   {master_only_count} ({_append_note})")
     log(f"Match rate:    {(matched / total_main * 100) if total_main > 0 else 0:.2f}%")
 
@@ -411,11 +462,14 @@ def perform_merge(main_df, ref_df):
     # VPXs that are actually present in Main, so a subset run (e.g. one LB)
     # never drags in vservers from other LBs.
     if APPEND_MASTER_ONLY and master_only_count > 0:
-        main_vpxs = set(main_df['VPX'].unique())
-        master_only_mask = (
-            ref_df[join_keys].apply(tuple, axis=1).isin(master_only_keys)
-            & ref_df['VPX'].isin(main_vpxs)
-        )
+        base_mask = ref_df[join_keys].apply(tuple, axis=1).isin(master_only_keys)
+        # VPX-scope the append only when VPX is part of the join key; with a
+        # name-only key there is no VPX scope, so append every Master-only name.
+        if 'VPX' in join_keys and 'VPX' in ref_df.columns:
+            main_vpxs = set(main_df['VPX'].unique())
+            master_only_mask = base_mask & ref_df['VPX'].isin(main_vpxs)
+        else:
+            master_only_mask = base_mask
         master_only_rows = ref_df[master_only_mask].copy()
 
         skipped_other_vpx = master_only_count - len(master_only_rows)

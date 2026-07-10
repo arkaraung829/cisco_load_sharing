@@ -14,6 +14,7 @@ FEATURES:
 """
 
 import os
+import re
 import sys
 import time
 import shutil
@@ -75,6 +76,46 @@ MATCH_KEY_COLUMNS = ['VPX', 'Virtual Server Name']
 #   False -> enrich matched rows only; drop Master-only rows from the output
 #            (they still remain untouched in Master.csv). Output == Main rows.
 APPEND_MASTER_ONLY = True
+
+# ADCs are deployed as HA pairs (…CVL01/02, …CVL03/04, …CVL05/06). The
+# extractor records whichever single node it connected to (e.g. …CVL03), but
+# the Master sheet may record the pair or the other node (…CVL04). When True,
+# every VPX is rewritten to its pair label (…CVL03/04) on BOTH files BEFORE
+# matching, so enrichment lands regardless of which node each file recorded,
+# and the merged output shows the unambiguous pair label.
+NORMALIZE_VPX_HA_PAIRS = True
+
+# Exceptions to the automatic odd/even pairing, if any node doesn't follow the
+# consecutive CVL<odd>/<even> rule. Map an exact VPX value -> desired label.
+#   e.g. {'LCLDMZHER-CVL07': 'LCLDMZHER-CVL07 (standalone)'}
+VPX_PAIR_OVERRIDES = {}
+
+# Matches a trailing "...CVL<num>" (optionally already "CVL<num>/<num>") so the
+# node number can be paired. Case-insensitive; anything after is preserved.
+_VPX_CVL_RE = re.compile(r'(?i)^(?P<prefix>.*?CVL)(?P<n1>\d+)(?:\s*/\s*\d+)?(?P<rest>.*)$')
+
+
+def canonical_vpx(value):
+    """
+    Map an HA-pair node VPX to its pair label:
+        'LCLDMZHER-CVL03'  -> 'LCLDMZHER-CVL03/04'
+        'LCLDMZHER-CVL04'  -> 'LCLDMZHER-CVL03/04'
+        'LCLDMZHER-CVL03/04' -> 'LCLDMZHER-CVL03/04'  (already paired)
+    Pairing is consecutive odd/even (01/02, 03/04, 05/06, ...). Values with no
+    'CVL<number>' token, or listed in VPX_PAIR_OVERRIDES, are returned as-is.
+    """
+    if not value:
+        return value
+    if value in VPX_PAIR_OVERRIDES:
+        return VPX_PAIR_OVERRIDES[value]
+    m = _VPX_CVL_RE.match(value.strip())
+    if not m:
+        return value
+    n1 = m.group('n1')
+    num = int(n1)
+    base = num if num % 2 == 1 else num - 1        # odd node is the pair base
+    width = max(2, len(n1))                          # preserve zero-padding
+    return f"{m.group('prefix')}{base:0{width}d}/{base + 1:0{width}d}{m.group('rest') or ''}"
 
 # Column name mapping: Master.csv name -> Main CSV name (rename before merge)
 # No rename needed — both files now use the same column names
@@ -253,7 +294,23 @@ def perform_merge(main_df, ref_df):
     log("=" * 60)
 
     ref_df = ref_df.copy()
+    main_df = main_df.copy()
     join_keys = MATCH_KEY_COLUMNS  # ['VPX', 'Virtual Server Name']
+
+    # --- HA-pair VPX normalization (before any matching) ---
+    # Rewrite each VPX to its pair label on BOTH files so a vserver enriches
+    # regardless of which HA node the extractor vs the Master sheet recorded.
+    if NORMALIZE_VPX_HA_PAIRS:
+        for df, lbl in [(main_df, "Main"), (ref_df, "Master")]:
+            if 'VPX' in df.columns:
+                before = df['VPX'].copy()
+                df['VPX'] = df['VPX'].map(canonical_vpx)
+                changed = int((before != df['VPX']).sum())
+                log(f"HA-pair VPX: rewrote {changed} of {len(df)} '{lbl}' VPX "
+                    f"values to pair labels")
+        # Show the resulting distinct VPX labels so a mismatch is obvious
+        log(f"Distinct VPX after pairing — Main: {sorted(main_df['VPX'].unique())[:8]}")
+        log(f"Distinct VPX after pairing — Master: {sorted(ref_df['VPX'].unique())[:8]}")
 
     # Rename Master.csv columns to match Main CSV names
     rename_applied = {k: v for k, v in COLUMN_RENAME_MAP.items() if k in ref_df.columns}

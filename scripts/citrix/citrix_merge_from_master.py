@@ -69,11 +69,12 @@ MATCH_KEY_COLUMNS = ['VPX', 'Virtual Server Name']
 # What to do with rows that exist in Master.csv but have NO match in Main
 # (the extractor output). This matters when Main was generated for only some
 # LBs, not all of them.
-#   False -> enrich matched rows only; ignore Master-only rows (add nothing).
-#            Output row count stays equal to Main. Safe for single-LB runs.
-#   True  -> also append Master-only rows, but ONLY for VPXs present in Main
-#            (so other LBs are never dragged in).
-APPEND_MASTER_ONLY = False
+#   True  -> keep Master-only rows in the output so their master values
+#            (owner/app) remain visible, but ONLY for VPXs present in Main
+#            (so other LBs are never dragged in). Safe for single-LB runs.
+#   False -> enrich matched rows only; drop Master-only rows from the output
+#            (they still remain untouched in Master.csv). Output == Main rows.
+APPEND_MASTER_ONLY = True
 
 # Column name mapping: Master.csv name -> Main CSV name (rename before merge)
 # No rename needed — both files now use the same column names

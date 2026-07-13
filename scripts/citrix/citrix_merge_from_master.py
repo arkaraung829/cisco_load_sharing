@@ -174,11 +174,13 @@ def report_owner_conflicts(ref_df, name_col='Virtual Server Name', owner_col='Ow
 # No rename needed — both files now use the same column names
 COLUMN_RENAME_MAP = {}
 
-# Columns to update/add from reference (Master.csv)
+# Columns to update/add from reference (Master.csv). A column here that does
+# not exist in Main (e.g. 'Environment') is CREATED in the output and filled
+# from Master; Master columns not listed here are dropped from the output.
 COLUMNS_TO_UPDATE = [
     'Owner Group', 'Contact', 'Status', 'Change Date', 'Change Record',
     'PPS Family', 'Support', 'Tech Lead', 'PM', 'PPS Lead', 'VP', 'Application',
-    'Redundancy',
+    'Redundancy', 'Environment',
 ]
 
 # Retry config

@@ -89,13 +89,14 @@ APPEND_MATCH_KEYS = ['VPX', 'Virtual Server Name']
 APPEND_MASTER_ONLY = True
 
 # Scope of the append (only used when APPEND_MASTER_ONLY is True):
+#   'all'          -> append every Master-only row, so ALL Master rows are
+#                     represented in the output (full inventory + live extract).
+#                     Includes KDC/DR copies, KDC-only apps, other appliances
+#                     you did not scan (e.g. KRSEMNS1-A), and any stale entries.
 #   'name-in-main' -> append a Master-only row ONLY if its vserver NAME also
-#                     appears in the extract. Brings in the KDC/DR copies of the
-#                     apps you actually scanned, but not unrelated LBs you did
-#                     not scan (e.g. KRSEMNS1-A). RECOMMENDED.
-#   'all'          -> append every Master-only row (full Master inventory,
-#                     including other datacenters and other LBs).
-APPEND_SCOPE = 'name-in-main'
+#                     appears in the extract (KDC/DR copies of scanned apps
+#                     only; unrelated LBs and KDC-only apps are left out).
+APPEND_SCOPE = 'all'
 
 # HA-pair VPX rewriting. OFF by default: in this environment HA pairs span two
 # datacenters with different prefixes (…HER-CVL03 <-> …KDC-CVL04), which the

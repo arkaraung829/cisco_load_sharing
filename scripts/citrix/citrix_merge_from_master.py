@@ -58,7 +58,11 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ===== CONFIGURATION =====
-MAIN_CSV_FILE = os.path.join(REPORTS_DIR, "combined_load_balancers 1.csv")
+# Must be the file the extractor actually writes (citrix_vip_backend_extractor.py
+# -> "combined_load_balancers.csv"). Pointing this at a manually-renamed copy
+# like "combined_load_balancers 1.csv" merges a STALE extract, so fresh backend
+# state (effective state, resolved GSLB service names) never reaches the output.
+MAIN_CSV_FILE = os.path.join(REPORTS_DIR, "combined_load_balancers.csv")
 REFERENCE_CSV_FILE = os.path.join(SCRIPT_DIR, "Master.csv")
 OUTPUT_CSV_FILE = os.path.join(REPORTS_DIR, "combined_load_balancers_MERGED.csv")
 

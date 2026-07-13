@@ -557,10 +557,32 @@ def perform_merge(main_df, ref_df):
         status = "OK" if count > 0 else "ZERO UPDATES"
         log(f"  {col:<20s}: {count:>6} rows updated  [{status}]")
 
-    # Warn about columns with zero updates
+    # Warn about columns with zero updates, and explain WHY: is the column's
+    # data on vservers that exist in the extract (then it's a bug) or only on
+    # names the extractor never saw (then zero is expected — the values live on
+    # rows that can only appear via the Master-only append)?
     zero_cols = [c for c, v in updated_counts.items() if v == 0]
     if zero_cols:
-        log(f"\nWARNING: These columns had ZERO updates (check Master.csv has data): {zero_cols}", "WARNING")
+        log(f"\nWARNING: These columns had ZERO updates: {zero_cols}", "WARNING")
+        main_names = set(main_df['Virtual Server Name'])
+        for c in zero_cols:
+            if c not in ref_df.columns:
+                log(f"    '{c}': not a column in Master — nothing to merge.", "WARNING")
+                continue
+            names_with_val = set(ref_df.loc[ref_df[c].str.strip() != '', 'Virtual Server Name'])
+            in_extract = len(names_with_val & main_names)
+            if len(names_with_val) == 0:
+                log(f"    '{c}': Master has 0 non-blank values.", "WARNING")
+            elif in_extract == 0:
+                log(f"    '{c}': {len(names_with_val)} vserver(s) carry a value in "
+                    f"Master, but NONE are in the extract — so there is no matched "
+                    f"row to enrich. Expected. (They appear only on appended rows, "
+                    f"and only under APPEND_SCOPE='all' if their name isn't in the "
+                    f"extract.)", "WARNING")
+            else:
+                log(f"    '{c}': {in_extract} vserver(s) with a value ARE in the "
+                    f"extract but still didn't update — this IS unexpected, please "
+                    f"report.", "ERROR")
 
     log("=" * 60)
     log("MERGE COMPLETE", "SUCCESS")

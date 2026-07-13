@@ -418,11 +418,22 @@ def perform_merge(main_df, ref_df):
     # Prepare reference subset for matched rows: join keys + update columns
     ref_subset = ref_df[join_keys + ref_cols_available].copy()
 
-    # Deduplicate ref_subset on Virtual Server Name only (for merge purposes)
-    # Same VS Name across VPXs should have same Owner Group/Contact/etc.
-    # This prevents row multiplication during left join
-    ref_subset = ref_subset.drop_duplicates(subset=join_keys, keep='last')
-    log(f"Reference rows after VS Name dedup (for merge): {len(ref_subset)}")
+    # Collapse duplicate names to ONE row for the merge (prevents row
+    # multiplication), taking the FIRST NON-BLANK value per column. A plain
+    # keep='last' would discard a filled value when a later duplicate for the
+    # same name is blank — which is exactly why sparse columns like
+    # Application / Support / PM came back with zero updates (the DR copy of a
+    # vserver is often blank in those columns).
+    def _first_nonblank(series):
+        for v in series:
+            if str(v).strip() != '':
+                return v
+        return ''
+    ref_subset = (ref_subset
+                  .groupby(join_keys, as_index=False, sort=False)
+                  .agg({c: _first_nonblank for c in ref_cols_available}))
+    log(f"Reference rows after VS Name dedup (for merge): {len(ref_subset)} "
+        f"(first non-blank value kept per column)")
 
     # Add suffix to reference columns to avoid collision during merge
     ref_rename = {col: f"{col}__ref" for col in ref_cols_available}

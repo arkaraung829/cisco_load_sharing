@@ -514,7 +514,12 @@ def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=No
         f"/nitro/v1/config/csvserver_binding/{urllib.parse.quote(vname)}"
     )
     cs_json = safe_json_loads(cs_data)
-    policy_bindings = cs_json.get('csvserver_binding', [{}])[0].get('csvserver_cspolicy_binding', [])
+    binding_list = cs_json.get('csvserver_binding') or [{}]
+    binding_info = binding_list[0] if binding_list else {}
+    policy_bindings = binding_info.get('csvserver_cspolicy_binding', [])
+    # Default LB vserver binding — traffic matching NO policy goes here. CS
+    # vservers with zero policies bound route ALL traffic to this default LB.
+    default_lb_bindings = binding_info.get('csvserver_lbvserver_binding', [])
 
     # Sort by priority so the aligned lists read top-to-bottom in bind order
     def _prio(b):
@@ -558,6 +563,20 @@ def fetch_cs_vserver_bindings(pool, csserver, cspolicy_map=None, csaction_map=No
         actions.append(action)
         target_vs.append(action_target)
         target_lb_status.append(vserver_state_map.get(this_lb, '') if this_lb else '')
+
+    # --- Default LB vserver (catch-all) ---
+    # Emitted as the last line of the folded lists with rule '(default)'.
+    # For CS vservers with no policies at all (e.g. Kubernetes ingress-style
+    # CS), this is the ONLY target — previously these rows came out blank.
+    for b in default_lb_bindings:
+        dlb = b.get('lbvserver', '')
+        if not dlb:
+            continue
+        rules.append('(default)')
+        target_lbs.append(dlb)
+        actions.append('')
+        target_vs.append('')
+        target_lb_status.append(vserver_state_map.get(dlb, ''))
 
     return {
         'type': 'Content Switching',

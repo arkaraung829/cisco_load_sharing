@@ -609,6 +609,15 @@ def perform_merge(main_df, ref_df):
                     f"extract but still didn't update — this IS unexpected, please "
                     f"report.", "ERROR")
 
+    # Columns that exist only in Master (e.g. 'Environment') get created at the
+    # END of the frame; move them to mirror Master's layout, where Environment
+    # sits between 'Application' and 'VPX'.
+    if 'Environment' in merged.columns and 'Application' in merged.columns:
+        cols = [c for c in merged.columns if c != 'Environment']
+        cols.insert(cols.index('Application') + 1, 'Environment')
+        merged = merged[cols]
+        log("Placed 'Environment' after 'Application' (Master.csv layout)")
+
     log("=" * 60)
     log("MERGE COMPLETE", "SUCCESS")
     log("=" * 60)

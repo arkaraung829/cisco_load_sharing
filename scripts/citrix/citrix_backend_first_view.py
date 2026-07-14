@@ -1,35 +1,37 @@
 """
 citrix_backend_first_view.py
 
-Rearranges the Citrix extractor's output WITHOUT touching the extractor.
+Builds the APP-TEAM view from the Citrix extractor/merge output WITHOUT
+touching the extractor.
 
-citrix_vip_backend_extractor.py writes combined_load_balancers.csv as one
-WIDE row per vserver:
+Input is the wide CSV (one row per vserver, Backend1..N column blocks) —
+preferably combined_load_balancers_MERGED.csv so owner/app enrichment is
+present. Output is ONE ROW PER BACKEND SERVER in the fixed app-team layout:
 
-    ... vserver columns ... | Backend1 block | Backend2 block | ... BackendN
-
-This script reads that CSV after the data is gathered and flips the layout:
-
-    ONE ROW PER BACKEND SERVER — backend columns FIRST, vserver beside it:
-
-    Backend Name | Backend IP | FQDN | Status | Location | VPX | Type |
-    Virtual Server Name | Virtual Server IP | ... | GSLB Domain | Policy ...
+    Owner Group | Application | Backend Name (Configured in Load Balancer) |
+    Backend IP | Backend Host FQDN (From Reverse DNS Lookup) |
+    Backend Status/Affected Status | Backend Location | Status | Change Date |
+    Change Record | Contact | PPS Family | Support | Tech Lead | PM |
+    PPS Lead | VP | Environment | VPX | Type of Virtual Server |
+    Virtual Server Name | Virtual Server IP | Virtual Server Port |
+    VIP Status | Final VIP Status | Redundancy | Progress Summary |
+    GSLB Domain | Policy Rule | Target LB VServer | Policy Action |
+    Target VServer | Target LB Status
 
 Rules:
-    - Every BackendName{i}/BackendIP{i}/BackendHost_FQDN{i}/BackendStatus{i}/
-      BackendLocation{i} group with data becomes its own output row.
-    - All non-backend columns (Owner Group ... Application, VPX, vserver
-      details, GSLB Domain, policy columns) are carried over unchanged, so
-      nothing from the wide file is lost — including owner/app enrichment
-      if you run it against the MERGED file.
+    - Every BackendName{i}/BackendIP{i}/... group with data becomes its own row.
     - Vservers with NO backends (CS/CR/VPN rows, empty LBs) are kept as a
       single row with blank backend columns so the inventory stays complete.
+    - Input columns missing from the source file (e.g. 'Environment' when run
+      against a raw extract, or 'Final VIP Status' which the app team fills
+      in manually) are emitted blank and reported once at startup.
 
 Usage:
     python citrix_backend_first_view.py [input.csv] [output.csv]
 
 Defaults:
-    input  : <project>/reports/citrix/combined_load_balancers.csv
+    input  : <project>/reports/citrix/combined_load_balancers_MERGED.csv
+             (falls back to combined_load_balancers.csv — owners blank there)
     output : <input basename>_backend_first.csv, same folder
 """
 
@@ -45,40 +47,92 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports", "citrix")
 
+# Prefer the MERGED file: it carries Owner Group / Application / Environment.
 DEFAULT_INPUT_CANDIDATES = [
-    os.path.join(REPORTS_DIR, "combined_load_balancers.csv"),
     os.path.join(REPORTS_DIR, "combined_load_balancers_MERGED.csv"),
+    os.path.join(REPORTS_DIR, "combined_load_balancers.csv"),
 ]
 
 BACKEND_FIELDS = ['BackendName', 'BackendIP', 'BackendHost_FQDN',
                   'BackendStatus', 'BackendLocation']
-BACKEND_OUT_HEADER = ['Backend Name', 'Backend IP', 'Backend Host FQDN',
-                      'Backend Status', 'Backend Location']
+
+# ===== APP-TEAM OUTPUT LAYOUT (fixed column order) =====
+# Each entry: (output header, source). source is either
+#   ('backend', i)  -> field i of the backend block (0=name .. 4=location)
+#   ('col', name)   -> carried from the input column of that name ('' if absent)
+APP_TEAM_LAYOUT = [
+    ('Owner Group',                                   ('col', 'Owner Group')),
+    ('Application',                                   ('col', 'Application')),
+    ('Backend Name (Configured in Load Balancer)',    ('backend', 0)),
+    ('Backend IP',                                    ('backend', 1)),
+    ('Backend Host FQDN (From Reverse DNS Lookup)',   ('backend', 2)),
+    ('Backend Status/Affected Status',                ('backend', 3)),
+    ('Backend Location',                              ('backend', 4)),
+    ('Status',                                        ('col', 'Status')),
+    ('Change Date',                                   ('col', 'Change Date')),
+    ('Change Record',                                 ('col', 'Change Record')),
+    ('Contact',                                       ('col', 'Contact')),
+    ('PPS Family',                                    ('col', 'PPS Family')),
+    ('Support',                                       ('col', 'Support')),
+    ('Tech Lead',                                     ('col', 'Tech Lead')),
+    ('PM',                                            ('col', 'PM')),
+    ('PPS Lead',                                      ('col', 'PPS Lead')),
+    ('VP',                                            ('col', 'VP')),
+    ('Environment',                                   ('col', 'Environment')),
+    ('VPX',                                           ('col', 'VPX')),
+    ('Type of Virtual Server',                        ('col', 'Type of Virtual Server')),
+    ('Virtual Server Name',                           ('col', 'Virtual Server Name')),
+    ('Virtual Server IP',                             ('col', 'Virtual Server IP')),
+    ('Virtual Server Port',                           ('col', 'Virtual Server Port')),
+    ('VIP Status',                                    ('col', 'VIP Status')),
+    ('Final VIP Status',                              ('col', 'Final VIP Status')),
+    ('Redundancy',                                    ('col', 'Redundancy')),
+    ('Progress Summary',                              ('col', 'Progress Summary')),
+    ('GSLB Domain',                                   ('col', 'GSLB Domain')),
+    ('Policy Rule',                                   ('col', 'Policy Rule')),
+    ('Target LB VServer',                             ('col', 'Target LB VServer')),
+    ('Policy Action',                                 ('col', 'Policy Action')),
+    ('Target VServer',                                ('col', 'Target VServer')),
+    ('Target LB Status',                              ('col', 'Target LB Status')),
+]
+
+
+def detect_input_encoding(path):
+    """
+    The extractor writes utf-8; the merge writes utf-8-sig; Excel re-saves as
+    cp1252. Try in that order — utf-8-sig also reads plain utf-8/ascii, and
+    latin-1 is a last resort that never fails.
+    """
+    for enc in ('utf-8-sig', 'cp1252'):
+        try:
+            with open(path, mode='r', newline='', encoding=enc) as f:
+                for _ in f:
+                    pass
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return 'latin-1'
 
 
 def find_backend_columns(header):
     """
     Detect BackendName1..N (and their IP/FQDN/Status/Location partners) by
     header name, so any max-backend width the extractor produced works.
-    Returns (blocks, backend_col_idxs):
-        blocks: list of [name_idx, ip_idx, fqdn_idx, status_idx, loc_idx]
-                sorted by backend number (missing partner -> None)
-        backend_col_idxs: set of all column indexes that belong to backends
+    Returns: blocks — list of [name_idx, ip_idx, fqdn_idx, status_idx, loc_idx]
+    sorted by backend number (missing partner -> None).
     """
     pos = {name: idx for idx, name in enumerate(header)}
     numbers = set()
-    backend_idxs = set()
     pat = re.compile(r'^(' + '|'.join(BACKEND_FIELDS) + r')(\d+)$')
-    for name, idx in pos.items():
+    for name in pos:
         m = pat.match(name)
         if m:
             numbers.add(int(m.group(2)))
-            backend_idxs.add(idx)
 
     blocks = []
     for i in sorted(numbers):
         blocks.append([pos.get(f'{field}{i}') for field in BACKEND_FIELDS])
-    return blocks, backend_idxs
+    return blocks
 
 
 def get(row, idx):
@@ -88,44 +142,65 @@ def get(row, idx):
 
 
 def rearrange(input_file, output_file):
-    with open(input_file, mode='r', newline='', encoding='utf-8-sig') as f:
-        reader = csv.reader(f)
-        header = next(reader)
+    encoding = detect_input_encoding(input_file)
+    print(f"  Encoding: {encoding}")
 
-        blocks, backend_idxs = find_backend_columns(header)
+    with open(input_file, mode='r', newline='', encoding=encoding) as f:
+        reader = csv.reader(f)
+        header = [h.strip() for h in next(reader)]
+
+        blocks = find_backend_columns(header)
         if not blocks:
             print("[ERROR] No BackendName1.. columns found in the input header. "
-                  "Is this the extractor's combined_load_balancers.csv?")
+                  "Is this the extractor's combined_load_balancers CSV?")
             sys.exit(1)
 
-        # Every non-backend column is carried over, in original order
-        keep_idxs = [i for i in range(len(header)) if i not in backend_idxs]
-        out_header = BACKEND_OUT_HEADER + [header[i] for i in keep_idxs]
+        pos = {name: idx for idx, name in enumerate(header)}
+        # Resolve each layout entry to a column index now; None -> blank
+        col_sources = []
+        missing_cols = []
+        for out_name, source in APP_TEAM_LAYOUT:
+            if source[0] == 'col':
+                idx = pos.get(source[1])
+                if idx is None:
+                    missing_cols.append(source[1])
+                col_sources.append(('col', idx))
+            else:
+                col_sources.append(source)
 
-        print(f"  Input columns : {len(header)} "
-              f"({len(blocks)} backend blocks, {len(keep_idxs)} vserver/owner columns)")
+        out_header = [name for name, _ in APP_TEAM_LAYOUT]
+
+        print(f"  Input columns : {len(header)} ({len(blocks)} backend blocks)")
+        if missing_cols:
+            print(f"  Not in input (emitted blank): {missing_cols}")
 
         vservers = 0
         vservers_no_backends = 0
         backend_rows = 0
         unique_backend_ips = set()
         rows_by_type = defaultdict(int)
+        type_idx = pos.get('Type of Virtual Server')
 
-        with open(output_file, mode='w', newline='', encoding='utf-8') as out:
+        with open(output_file, mode='w', newline='', encoding='utf-8-sig') as out:
             writer = csv.writer(out)
             writer.writerow(out_header)
-
-            type_idx = None
-            if 'Type of Virtual Server' in header:
-                type_idx = header.index('Type of Virtual Server')
 
             for row in reader:
                 if not any(c.strip() for c in row):
                     continue
                 vservers += 1
-                vserver_cols = [get(row, i) for i in keep_idxs]
                 if type_idx is not None:
                     rows_by_type[get(row, type_idx) or '(blank)'] += 1
+
+                def emit(backend_vals):
+                    out_row = []
+                    for kind_idx, src in zip(col_sources, APP_TEAM_LAYOUT):
+                        kind = kind_idx[0]
+                        if kind == 'col':
+                            out_row.append(get(row, kind_idx[1]))
+                        else:  # ('backend', i)
+                            out_row.append(backend_vals[src[1][1]])
+                    writer.writerow(out_row)
 
                 wrote_backend = False
                 for name_i, ip_i, fqdn_i, status_i, loc_i in blocks:
@@ -133,9 +208,8 @@ def rearrange(input_file, output_file):
                     bip = get(row, ip_i)
                     if not bname and not bip:
                         continue
-                    writer.writerow([bname, bip, get(row, fqdn_i),
-                                     get(row, status_i), get(row, loc_i)]
-                                    + vserver_cols)
+                    emit([bname, bip, get(row, fqdn_i),
+                          get(row, status_i), get(row, loc_i)])
                     backend_rows += 1
                     wrote_backend = True
                     if bip and bip not in ('N/A', '0.0.0.0'):
@@ -143,7 +217,7 @@ def rearrange(input_file, output_file):
 
                 if not wrote_backend:
                     # Keep vservers with nothing behind them visible
-                    writer.writerow(['', '', '', '', ''] + vserver_cols)
+                    emit(['', '', '', '', ''])
                     vservers_no_backends += 1
 
     return {
@@ -167,9 +241,9 @@ def main():
                 input_file = cand
                 break
     if not input_file or not os.path.exists(input_file):
-        print("[ERROR] Input CSV not found. Pass the extractor output as the "
-              "first argument, e.g.:")
-        print("    python citrix_backend_first_view.py combined_load_balancers.csv")
+        print("[ERROR] Input CSV not found. Pass the merged (or extractor) "
+              "output as the first argument, e.g.:")
+        print("    python citrix_backend_first_view.py combined_load_balancers_MERGED.csv")
         sys.exit(1)
 
     if len(args) >= 2:
@@ -179,10 +253,14 @@ def main():
         output_file = f"{base}_backend_first{ext or '.csv'}"
 
     print("=" * 80)
-    print("CITRIX BACKEND-FIRST VIEW — one row per backend, vserver beside it")
+    print("CITRIX BACKEND-FIRST VIEW — app-team format, one row per backend")
     print("=" * 80)
     print(f"  Input  : {input_file}")
     print(f"  Output : {output_file}")
+    if 'MERGED' not in os.path.basename(input_file).upper():
+        print("  [NOTE] Input is not the MERGED file — Owner Group/Application/"
+              "Environment will be blank. Run citrix_merge_from_master.py first "
+              "for the enriched app-team view.")
 
     stats = rearrange(input_file, output_file)
 

@@ -102,11 +102,14 @@ APPEND_MASTER_ONLY = True
 #                     only; unrelated LBs and KDC-only apps are left out).
 APPEND_SCOPE = 'all'
 
-# HA-pair VPX rewriting. OFF by default: in this environment HA pairs span two
-# datacenters with different prefixes (…HER-CVL03 <-> …KDC-CVL04), which the
-# simple same-prefix odd/even pairing below does NOT bridge, and matching is
-# done on name anyway. Kept for reference / other environments.
-NORMALIZE_VPX_HA_PAIRS = False
+# HA-pair VPX rewriting: rewrite each VPX to its same-prefix odd/even pair
+# label on BOTH files before matching (…HER-CVL03 and …HER-CVL04 both become
+# …HER-CVL03/04). This collapses the extract row and Master's partner-node row
+# of the SAME appliance pair into one output row instead of two near-duplicate
+# rows, and the output VPX shows the pair label. Different prefixes stay
+# separate rows by design (…KDC-CVL03/04 is the other datacenter, not a dup).
+# Enrichment itself still matches on Virtual Server Name.
+NORMALIZE_VPX_HA_PAIRS = True
 
 # Exceptions to the automatic odd/even pairing, if any node doesn't follow the
 # consecutive CVL<odd>/<even> rule. Map an exact VPX value -> desired label.
@@ -366,6 +369,21 @@ def perform_merge(main_df, ref_df):
         # Show the resulting distinct VPX labels so a mismatch is obvious
         log(f"Distinct VPX after pairing — Main: {sorted(main_df['VPX'].unique())[:8]}")
         log(f"Distinct VPX after pairing — Master: {sorted(ref_df['VPX'].unique())[:8]}")
+
+    # Drop fully-noise reference rows (no Virtual Server Name) and warn loudly
+    # if Master is mostly empty — a corrupted/partial Master.csv otherwise
+    # silently merges nothing.
+    blank_names = (ref_df['Virtual Server Name'].astype(str).str.strip() == '')
+    if blank_names.any():
+        n_blank = int(blank_names.sum())
+        ref_df = ref_df[~blank_names]
+        level = "ERROR" if n_blank > len(ref_df) else "WARNING"
+        log(f"Master.csv: dropped {n_blank} row(s) with NO Virtual Server Name; "
+            f"{len(ref_df)} usable data rows remain.", level)
+        if n_blank > len(ref_df):
+            log("Master.csv is MOSTLY EMPTY — check the file (was it filtered/"
+                "re-saved incorrectly?) or restore it from a backup before "
+                "trusting this merge.", "ERROR")
 
     # Flag any vserver name whose Master rows disagree on owner (name-only join)
     report_owner_conflicts(ref_df)

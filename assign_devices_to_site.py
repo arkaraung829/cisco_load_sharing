@@ -52,6 +52,9 @@ COL_SITE = "site"
 
 EXEC_POLL_INTERVAL = 2   # seconds between execution-status polls
 EXEC_POLL_TIMEOUT = 120  # give up polling after this many seconds
+ASSIGN_RETRIES = 3       # extra attempts when Catalyst Center returns 429/5xx
+RETRY_DELAY = 15         # seconds before first retry (doubles each attempt)
+PAUSE_BETWEEN_SITES = 2  # seconds between per-site assignment calls
 
 
 def load_dotenv():
@@ -181,6 +184,44 @@ class DnacClient:
         return {"status": "TIMEOUT", "bapiError": f"no result after {EXEC_POLL_TIMEOUT}s"}
 
 
+def http_error_detail(exc):
+    """Pull the human-readable error out of a Catalyst Center error response."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return str(exc)
+    try:
+        err = resp.json().get("errorResponse") or {}
+    except ValueError:
+        return f"HTTP {resp.status_code}: {resp.text[:500]}"
+    parts = []
+    bapi_msg = (err.get("bapiErrorResponse") or {}).get("bapiErrorMessage")
+    if bapi_msg:
+        parts.append(bapi_msg)
+    for comp in err.get("componentErrorResponse") or []:
+        msg = comp.get("componentErrorMessage") or comp.get("errorMessage")
+        if msg:
+            parts.append(msg)
+    return "; ".join(parts) or f"HTTP {resp.status_code}: {resp.text[:500]}"
+
+
+def assign_with_retry(dnac, site_id, ips):
+    """Assign, retrying with growing waits when the server is overloaded."""
+    delay = RETRY_DELAY
+    for attempt in range(ASSIGN_RETRIES + 1):
+        try:
+            result = dnac.assign_devices(site_id, ips)
+            return dnac.wait_for_execution(result)
+        except requests.HTTPError as exc:
+            resp = exc.response
+            retryable = resp is not None and resp.status_code in (429, 500, 502, 503, 504)
+            if not retryable or attempt == ASSIGN_RETRIES:
+                raise
+            print(f"  .. HTTP {resp.status_code} from Catalyst Center, "
+                  f"waiting {delay}s then retrying ({attempt + 1}/{ASSIGN_RETRIES})")
+            time.sleep(delay)
+            delay *= 2
+
+
 # -- Step 2: read the input file and group rows by site -------------------
 def read_rows(path):
     """Yield (ip, site) tuples from an .xlsx or .csv file."""
@@ -271,13 +312,14 @@ def main():
             continue
 
         try:
-            result = dnac.assign_devices(site_id, assignable)
-            status = dnac.wait_for_execution(result)
+            status = assign_with_retry(dnac, site_id, assignable)
         except requests.HTTPError as exc:
-            detail = exc.response.text[:300] if exc.response is not None else str(exc)
+            detail = http_error_detail(exc)
             print(f"  !! assignment request failed: {detail}\n")
             failed.extend((ip, site_name, detail) for ip in assignable)
             continue
+        finally:
+            time.sleep(PAUSE_BETWEEN_SITES)
 
         # Depending on the Catalyst Center version, a successful synchronous
         # run reports status "SUCCESS" or the string "True" (with the human-

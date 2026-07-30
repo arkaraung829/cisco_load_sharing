@@ -55,13 +55,16 @@ EXEC_POLL_TIMEOUT = 120  # give up polling after this many seconds
 
 
 def load_dotenv():
-    """Load KEY=VALUE pairs from a .env file next to this script into os.environ.
+    """Load KEY=VALUE pairs from a .env (or credential.env) file next to this
+    script into os.environ.
 
     Real environment variables take priority over .env values. Lines starting
     with '#' and blank lines are ignored; optional surrounding quotes stripped.
     """
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.isfile(env_path):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = next((p for p in (os.path.join(script_dir, name) for name in (".env", "credential.env"))
+                     if os.path.isfile(p)), None)
+    if env_path is None:
         return
     with open(env_path) as f:
         for line in f:

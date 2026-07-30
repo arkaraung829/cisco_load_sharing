@@ -279,12 +279,16 @@ def main():
             failed.extend((ip, site_name, detail) for ip in assignable)
             continue
 
-        if status.get("status") in ("SUCCESS", None) and not status.get("bapiError"):
-            msg = status.get("bapiName") or status.get("message") or "assigned"
-            print(f"  => {msg}\n")
+        # Depending on the Catalyst Center version, a successful synchronous
+        # run reports status "SUCCESS" or the string "True" (with the human-
+        # readable outcome in result.progress).
+        outcome = str(status.get("status", "")).upper()
+        progress = (status.get("result") or {}).get("progress", "")
+        if not status.get("bapiError") and outcome in ("SUCCESS", "TRUE", ""):
+            print(f"  => {progress or status.get('message') or 'assigned'}\n")
             ok.extend((ip, site_name) for ip in assignable)
         else:
-            err = status.get("bapiError") or status.get("message") or str(status)
+            err = status.get("bapiError") or progress or status.get("message") or str(status)
             print(f"  !! assignment failed: {err}\n")
             failed.extend((ip, site_name, err) for ip in assignable)
 

@@ -22,8 +22,15 @@ Usage:
     python assign_devices_to_site.py --host dnac.example.com --file devices.xlsx
     python assign_devices_to_site.py --host 10.1.1.10 --file devices.csv --insecure --dry-run
 
-Credentials are taken from --username/--password, or from the environment
-variables DNAC_USER / DNAC_PASSWORD (password is prompted for if absent).
+Credentials and host are taken from (highest priority first):
+    1. command-line flags --host / --username / --password
+    2. environment variables DNAC_HOST / DNAC_USER / DNAC_PASSWORD
+    3. a .env file in the same folder as this script, e.g.:
+           DNAC_HOST=10.1.1.10
+           DNAC_USER=admin
+           DNAC_PASSWORD=YourPassword123
+Anything still missing is prompted for interactively (password hidden).
+Keep the .env file out of git - it is listed in .gitignore.
 
 Requires: requests. For .xlsx input also: openpyxl (CSV needs nothing extra).
 """
@@ -47,9 +54,31 @@ EXEC_POLL_INTERVAL = 2   # seconds between execution-status polls
 EXEC_POLL_TIMEOUT = 120  # give up polling after this many seconds
 
 
+def load_dotenv():
+    """Load KEY=VALUE pairs from a .env file next to this script into os.environ.
+
+    Real environment variables take priority over .env values. Lines starting
+    with '#' and blank lines are ignored; optional surrounding quotes stripped.
+    """
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
 def parse_args():
+    load_dotenv()
     p = argparse.ArgumentParser(description="Assign devices to Catalyst Center sites from an Excel/CSV file.")
-    p.add_argument("--host", required=True, help="Catalyst Center hostname or IP (no scheme)")
+    p.add_argument("--host", default=os.environ.get("DNAC_HOST"),
+                   help="Catalyst Center hostname or IP, no scheme (or set DNAC_HOST)")
     p.add_argument("--file", required=True, help="Input .xlsx or .csv file with IP Address / Site columns")
     p.add_argument("--username", default=os.environ.get("DNAC_USER"), help="API username (or set DNAC_USER)")
     p.add_argument("--password", default=os.environ.get("DNAC_PASSWORD"), help="API password (or set DNAC_PASSWORD)")
@@ -57,6 +86,8 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true", help="Resolve sites and devices but do not assign anything")
     args = p.parse_args()
 
+    if not args.host:
+        args.host = input("Catalyst Center host/IP: ")
     if not args.username:
         args.username = input("Catalyst Center username: ")
     if not args.password:

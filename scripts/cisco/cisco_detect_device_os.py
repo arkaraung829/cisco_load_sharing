@@ -33,6 +33,7 @@ install_if_missing(["netmiko"])
 # ── Load shared config ─────────────────────────────────────────
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import config
+print(f"[DEBUG] config module loaded from: {getattr(config, '__file__', 'unknown')}")
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
@@ -58,6 +59,10 @@ ENABLE_PASSWORD = config.get_cred('cisco_default', 'enable_password')
 LOCAL_USERNAME        = config.get_cred('cisco_local', 'username')
 LOCAL_PASSWORD        = config.get_cred('cisco_local', 'password')
 LOCAL_ENABLE_PASSWORD = config.get_cred('cisco_local', 'enable_password')
+
+print(f"[DEBUG] cisco_default username came from config: {config.get_cred('cisco_default', 'username') is not None} "
+      f"(resolved username='{USERNAME}')")
+print(f"[DEBUG] cisco_default password came from config: {config.get_cred('cisco_default', 'password') is not None}")
 
 # Path to the device list file (one IP per line, or CSV: ip,username,password,enable)
 DEVICE_LIST_FILE = os.path.join(DATA_DIR, "devices.txt")

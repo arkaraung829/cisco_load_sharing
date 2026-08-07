@@ -166,12 +166,13 @@ def detect_device_type(device_ip, username, password, enable_password=None):
     Returns:
         tuple: (success: bool, device_type: str, device_info: dict)
     """
-    print(f"Detecting device type for {device_ip}...", end=" ")
+    print(f"Detecting device type for {device_ip}...")
 
     credential_sets = build_credential_sets(username, password, enable_password)
     last_error = "Unable to detect device type"
 
     for cred_index, cred in enumerate(credential_sets):
+        print(f"  Trying {cred['label']} ({cred['username']})...", end=" ")
         for device_type in DEVICE_TYPES_TO_TRY:
             try:
                 device_config = {
@@ -208,25 +209,36 @@ def detect_device_type(device_ip, username, password, enable_password=None):
                 print(f"✓ Detected: {device_info['os_type']} ({device_info['model']}){label_suffix}")
                 return True, device_type, device_info
 
-            except NetmikoAuthenticationException:
+            except NetmikoAuthenticationException as exc:
                 # Wrong credentials for this device_type/credential set;
                 # stop trying other device_types with the same credentials
                 # and fall through to the next credential set, if any.
-                last_error = f"Authentication failed ({cred['label']})"
+                # NOTE: Netmiko also raises this exception for some
+                # non-credential failures (e.g. a login banner delaying
+                # the prompt, or an SSH kex/cipher the device doesn't
+                # support) - the original exception text below is the
+                # real reason, not necessarily a bad password.
+                detail = str(exc).strip().splitlines()[-1] if str(exc).strip() else "no detail from Netmiko"
+                last_error = f"Authentication failed ({cred['label']}): {detail}"
+                print(f"✗ {last_error}")
                 break
-            except NetmikoTimeoutException:
+            except NetmikoTimeoutException as exc:
                 # Device unreachable - no point retrying with other
                 # credentials or device_types.
-                last_error = "Connection timed out"
+                last_error = f"Connection timed out: {exc}"
                 print(f"✗ {last_error}")
                 return False, None, _failed_device_info(device_ip, last_error)
             except Exception as exc:
                 # Try next device_type with the same credentials
                 last_error = str(exc) or "Unable to detect device type"
                 continue
+        else:
+            # Inner for-loop finished without a `break` (every device_type
+            # raised something other than an auth exception) - report it
+            # and move on to the next credential set, if any.
+            print(f"✗ {last_error}")
 
-    # If every credential set / device_type combination failed
-    print(f"✗ {last_error}")
+    # Every credential set / device_type combination failed
     return False, None, _failed_device_info(device_ip, last_error)
 
 

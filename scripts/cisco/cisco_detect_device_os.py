@@ -437,6 +437,17 @@ def main():
     print("Cisco Device Type Detector")
     print(f"{'='*80}\n")
 
+    if not PASSWORD:
+        print("✗ ERROR: cisco_default password could not be retrieved from config.py "
+              "(config.get_cred('cisco_default', 'password') returned nothing).")
+        print("  This has been observed to be intermittent - the same lookup can succeed on one")
+        print("  run and fail on the next - which points to a flaky credential source in your")
+        print("  config.py (vault/API/Credential Manager lookup) rather than a wrong password.")
+        print("  Refusing to proceed with an empty password to avoid a false 'auth failed' /")
+        print("  'no authentication methods available' error and unnecessary device login attempts.")
+        print("  Fix config.py's credential retrieval, or re-run once it succeeds, then retry.\n")
+        sys.exit(1)
+
     # Load devices from file
     devices = load_devices_from_file(DEVICE_LIST_FILE)
     print(f"Total devices to detect: {len(devices)}\n")

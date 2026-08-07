@@ -1,0 +1,14 @@
+# Device list for cisco_detect_device_os.py
+#
+# One device per line. Supported formats:
+#   ip
+#   ip,username,password[,enable]
+#
+# Lines starting with '#' or blank lines are ignored. When only an IP
+# is given, the "cisco_default" (service account) credentials from
+# scripts/credentials.ini are used first, falling back automatically
+# to the "cisco_local" credentials if the service account fails to
+# authenticate.
+
+10.61.5.58
+10.61.5.70

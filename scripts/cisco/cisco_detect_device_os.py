@@ -39,7 +39,10 @@ from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 import re
 import csv
+import io
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # ===== PATH SETUP =====
@@ -89,6 +92,12 @@ DEVICE_LIST_FILE = os.path.join(DATA_DIR, "devices.txt")
 
 # Timeout for connection attempts
 TIMEOUT = 15
+
+# How many devices to probe concurrently. SSH connects are mostly spent
+# waiting on the network/device, so threads give a large speedup with
+# little risk. Keep this modest so we don't hammer a shared AAA/TACACS
+# server with a burst of simultaneous logins.
+MAX_WORKERS = 8
 
 # Netmiko device_type values to try, covering IOS, IOS-XE (incl. Catalyst),
 # NX-OS (Nexus) and IOS-XR platforms, plus ASA firewalls.
@@ -190,15 +199,16 @@ def detect_device_type(device_ip, username, password, enable_password=None):
         password: SSH password (service account)
         enable_password: Enable password (optional)
     Returns:
-        tuple: (success: bool, device_type: str, device_info: dict)
+        tuple: (success: bool, device_type: str, device_info: dict, log_text: str)
     """
-    print(f"Detecting device type for {device_ip}...")
+    out = io.StringIO()
+    print(f"Detecting device type for {device_ip}...", file=out)
 
     credential_sets = build_credential_sets(username, password, enable_password)
     last_error = "Unable to detect device type"
 
     for cred_index, cred in enumerate(credential_sets):
-        print(f"  Trying {cred['label']} ({cred['username']})...", end=" ")
+        print(f"  Trying {cred['label']} ({cred['username']})...", end=" ", file=out)
         for device_type in DEVICE_TYPES_TO_TRY:
             try:
                 device_config = {
@@ -232,8 +242,8 @@ def detect_device_type(device_ip, username, password, enable_password=None):
                 device_info['ip'] = device_ip
                 device_info['credential_used'] = cred['label']
                 label_suffix = f" [{cred['label']}]" if cred_index > 0 else ""
-                print(f"✓ Detected: {device_info['os_type']} ({device_info['model']}){label_suffix}")
-                return True, device_type, device_info
+                print(f"✓ Detected: {device_info['os_type']} ({device_info['model']}){label_suffix}", file=out)
+                return True, device_type, device_info, out.getvalue()
 
             except NetmikoAuthenticationException as exc:
                 # Wrong credentials for this device_type/credential set;
@@ -246,14 +256,14 @@ def detect_device_type(device_ip, username, password, enable_password=None):
                 # real reason, not necessarily a bad password.
                 detail = str(exc).strip().splitlines()[-1] if str(exc).strip() else "no detail from Netmiko"
                 last_error = f"Authentication failed ({cred['label']}): {detail}"
-                print(f"✗ {last_error}")
+                print(f"✗ {last_error}", file=out)
                 break
             except NetmikoTimeoutException as exc:
                 # Device unreachable - no point retrying with other
                 # credentials or device_types.
                 last_error = f"Connection timed out: {exc}"
-                print(f"✗ {last_error}")
-                return False, None, _failed_device_info(device_ip, last_error)
+                print(f"✗ {last_error}", file=out)
+                return False, None, _failed_device_info(device_ip, last_error), out.getvalue()
             except Exception as exc:
                 # Try next device_type with the same credentials
                 last_error = str(exc) or "Unable to detect device type"
@@ -262,10 +272,10 @@ def detect_device_type(device_ip, username, password, enable_password=None):
             # Inner for-loop finished without a `break` (every device_type
             # raised something other than an auth exception) - report it
             # and move on to the next credential set, if any.
-            print(f"✗ {last_error}")
+            print(f"✗ {last_error}", file=out)
 
     # Every credential set / device_type combination failed
-    return False, None, _failed_device_info(device_ip, last_error)
+    return False, None, _failed_device_info(device_ip, last_error), out.getvalue()
 
 
 def _failed_device_info(device_ip, error_msg):
@@ -483,16 +493,29 @@ def main():
     all_results = []
     successful = []
     failed = []
+    print_lock = threading.Lock()
+    worker_count = min(MAX_WORKERS, len(devices)) or 1
+    print(f"Probing devices concurrently with {worker_count} worker(s)...\n")
 
-    for dev in devices:
-        device_ip = dev['ip']
-        user = dev['username']
-        pwd = dev['password']
-        enable = dev.get('enable')
-        print(f"{'─'*80}")
-        success, device_type, device_info = detect_device_type(device_ip, user, pwd, enable)
-        all_results.append(device_info)
-        (successful if success else failed).append(device_info)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_dev = {
+            executor.submit(
+                detect_device_type, dev['ip'], dev['username'], dev['password'], dev.get('enable')
+            ): dev
+            for dev in devices
+        }
+        for future in as_completed(future_to_dev):
+            success, device_type, device_info, log_text = future.result()
+            with print_lock:
+                print(f"{'─'*80}")
+                print(log_text, end="")
+            all_results.append(device_info)
+            (successful if success else failed).append(device_info)
+
+    # Keep output deterministic regardless of which device finished first
+    all_results.sort(key=lambda d: d.get('ip', ''))
+    successful.sort(key=lambda d: d.get('ip', ''))
+    failed.sort(key=lambda d: d.get('ip', ''))
 
     # Print summary
     print(f"\n\n{'='*80}")

@@ -20,8 +20,9 @@ Credentials are resolved in this order (first match wins):
   3. The `default` argument passed to get_cred(), if any.
 
 The "cisco_default" section holds the primary/service-account
-credentials used for automation. The "cisco_local" section is an
-optional fallback (e.g. a personal/local device account) used when the
+credentials used for automation. The "cisco_local" section (and
+optional numbered siblings "cisco_local2", "cisco_local3", ...) are
+fallback accounts (e.g. personal/local device accounts) used when the
 service account fails to authenticate.
 """
 

@@ -55,14 +55,34 @@ USERNAME        = config.get_cred('cisco_default', 'username',        'araung')
 PASSWORD        = config.get_cred('cisco_default', 'password')
 ENABLE_PASSWORD = config.get_cred('cisco_default', 'enable_password')
 
-# Local-user fallback, tried only if the service account fails to authenticate
-LOCAL_USERNAME        = config.get_cred('cisco_local', 'username')
-LOCAL_PASSWORD        = config.get_cred('cisco_local', 'password')
-LOCAL_ENABLE_PASSWORD = config.get_cred('cisco_local', 'enable_password')
+# Local-user fallback, tried (in order) only if the service account fails to
+# authenticate. Multiple local accounts are supported via numbered sections
+# in credentials.ini: [cisco_local], [cisco_local2], [cisco_local3], ...
+# Any section missing a username or password is skipped.
+LOCAL_ACCOUNT_SECTIONS = ['cisco_local', 'cisco_local2', 'cisco_local3', 'cisco_local4', 'cisco_local5']
+
+
+def _load_local_accounts():
+    accounts = []
+    for section in LOCAL_ACCOUNT_SECTIONS:
+        local_username = config.get_cred(section, 'username')
+        local_password = config.get_cred(section, 'password')
+        if local_username and local_password:
+            accounts.append({
+                'label': f'local user [{section}]',
+                'username': local_username,
+                'password': local_password,
+                'enable': config.get_cred(section, 'enable_password'),
+            })
+    return accounts
+
+
+LOCAL_ACCOUNTS = _load_local_accounts()
 
 print(f"[DEBUG] cisco_default username came from config: {config.get_cred('cisco_default', 'username') is not None} "
       f"(resolved username='{USERNAME}')")
 print(f"[DEBUG] cisco_default password came from config: {config.get_cred('cisco_default', 'password') is not None}")
+print(f"[DEBUG] local-user fallback accounts configured: {len(LOCAL_ACCOUNTS)}")
 
 # Path to the device list file (one IP per line, or CSV: ip,username,password,enable)
 DEVICE_LIST_FILE = os.path.join(DATA_DIR, "devices.txt")
@@ -135,8 +155,9 @@ def build_credential_sets(username, password, enable_password):
     Build the ordered list of credential sets to attempt for a device:
       1. The device's own/service-account credentials (from devices.txt
          or the cisco_default config section).
-      2. The cisco_local fallback, only tried if #1 fails to authenticate,
-         and only if a local username/password is actually configured.
+      2. Each configured local-user fallback account, in the order defined
+         by LOCAL_ACCOUNT_SECTIONS, tried one at a time only if the
+         previous credential set failed to authenticate.
     """
     credential_sets = [{
         'label': 'service account',
@@ -145,12 +166,12 @@ def build_credential_sets(username, password, enable_password):
         'enable': enable_password,
     }]
 
-    if LOCAL_USERNAME and LOCAL_PASSWORD:
+    for account in LOCAL_ACCOUNTS:
         credential_sets.append({
-            'label': 'local user',
-            'username': LOCAL_USERNAME,
-            'password': LOCAL_PASSWORD,
-            'enable': LOCAL_ENABLE_PASSWORD or enable_password,
+            'label': account['label'],
+            'username': account['username'],
+            'password': account['password'],
+            'enable': account['enable'] or enable_password,
         })
 
     return credential_sets
@@ -452,10 +473,12 @@ def main():
     devices = load_devices_from_file(DEVICE_LIST_FILE)
     print(f"Total devices to detect: {len(devices)}\n")
 
-    if LOCAL_USERNAME and LOCAL_PASSWORD:
-        print(f"Local-user fallback is enabled for: {LOCAL_USERNAME}\n")
+    if LOCAL_ACCOUNTS:
+        names = ', '.join(account['username'] for account in LOCAL_ACCOUNTS)
+        print(f"Local-user fallback is enabled for {len(LOCAL_ACCOUNTS)} account(s): {names}\n")
     else:
-        print("Local-user fallback is not configured (set cisco_local credentials to enable it).\n")
+        print("Local-user fallback is not configured "
+              "(add [cisco_local], [cisco_local2], ... to credentials.ini to enable it).\n")
 
     all_results = []
     successful = []

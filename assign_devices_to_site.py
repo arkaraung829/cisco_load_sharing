@@ -39,6 +39,7 @@ import argparse
 import csv
 import getpass
 import os
+import re
 import sys
 import time
 from collections import OrderedDict
@@ -101,9 +102,15 @@ def parse_args():
     return args
 
 
+def normalize_host(host):
+    """Strip any scheme the caller already included (DNAC_HOST=https://... is
+    a common credential.env mistake) so we don't end up with https://https://."""
+    return re.sub(r"^\s*https?://", "", host.strip(), flags=re.IGNORECASE).rstrip("/")
+
+
 class DnacClient:
     def __init__(self, host, username, password, verify=True):
-        self.base = f"https://{host}"
+        self.base = f"https://{normalize_host(host)}"
         self.verify = verify
         if not verify:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -275,7 +282,7 @@ def main():
     total_devices = sum(len(v) for v in grouped.values())
     print(f"Loaded {total_devices} device(s) across {len(grouped)} site(s) from {args.file}\n")
 
-    print(f"Connecting to https://{args.host} ...")
+    print(f"Connecting to https://{normalize_host(args.host)} ...")
     dnac = DnacClient(args.host, args.username, args.password, verify=not args.insecure)
     print("Authenticated OK\n")
 

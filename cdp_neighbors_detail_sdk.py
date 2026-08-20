@@ -172,9 +172,18 @@ def inspect_sdk(api):
           "run_command(), wait_for_task(), and get_file() functions.")
 
 
+DEBUG = os.environ.get("CDP_SDK_DEBUG") == "1"
+
+
+def debug(msg):
+    if DEBUG:
+        print(f"[debug] {msg}")
+
+
 # -- Step 3: IP -> device UUID (via SDK) -------------------------------------
 def get_device_id(api, ip):
     method, name = resolve_method(api.devices, ["get_device_list", "get_device_by_ip", "get_network_device_by_ip"], "devices")
+    debug(f"devices call resolved to '{name}'")
     response = call_sdk(method, f"devices.{name}", managementIpAddress=ip)
     result = unwrap(response)
     if isinstance(result, list):
@@ -192,6 +201,7 @@ def run_command(api, device_ids, command):
          "run_read_only_commands_on_devices"],
         "command_runner",
     )
+    debug(f"command_runner call resolved to '{name}'")
     response = call_sdk(method, f"command_runner.{name}", commands=[command], deviceUuids=device_ids)
     task = unwrap(response)
     task_id = task.get("taskId") if isinstance(task, dict) else getattr(task, "taskId", None)
@@ -229,8 +239,13 @@ def wait_for_task(api, task_id):
 def get_file(api, file_id):
     method, name = resolve_method(
         api.file, ["download_a_file_by_fileid", "download_a_file_by_file_id", "get_file"], "file")
+    debug(f"file call resolved to '{name}'")
     response = call_sdk(method, f"file.{name}", file_id=file_id)
-    return unwrap(response)
+    debug(f"raw response from file.{name}: type={type(response).__name__} "
+          f"repr={repr(response)[:1000]}")
+    result = unwrap(response)
+    debug(f"after unwrap(): type={type(result).__name__} repr={repr(result)[:1000]}")
+    return result
 
 
 # -- Step 7: parse 'show cdp neighbors detail' text into structured rows ----
@@ -336,6 +351,10 @@ def main():
     file_id = wait_for_task(api, task_id)
     file_results = get_file(api, file_id)
     print("Command output retrieved.\n")
+    if not file_results:
+        print(f"!! File API returned no usable content (type={type(file_results).__name__}, "
+              f"value={file_results!r}). Re-run with CDP_SDK_DEBUG=1 set for full detail, "
+              f"e.g.:\n     set CDP_SDK_DEBUG=1  (cmd)   or   $env:CDP_SDK_DEBUG=\"1\"  (PowerShell)\n")
 
     dns_cache = {}
     rows = []

@@ -153,7 +153,10 @@ class DnacClient:
         resp = r.json().get("response") or {}
         task_id = resp.get("taskId")
         if not task_id:
-            sys.exit(f"ERROR: no taskId returned from read-request: {r.json()}")
+            # Per-batch problem, not a setup problem - raise so the caller can
+            # skip just this batch instead of aborting the whole (possibly
+            # 80+ batch) run.
+            raise RuntimeError(f"no taskId returned from read-request: {r.json()}")
         return task_id
 
     # -- Step 5: poll the task until it finishes -----------------------------
@@ -164,7 +167,7 @@ class DnacClient:
             r.raise_for_status()
             task = r.json().get("response") or {}
             if task.get("isError"):
-                sys.exit(f"ERROR: Command Runner task failed: {task.get('failureReason') or task}")
+                raise RuntimeError(f"Command Runner task failed: {task.get('failureReason') or task}")
             if task.get("endTime"):
                 progress = task.get("progress") or ""
                 try:
@@ -172,10 +175,10 @@ class DnacClient:
                 except (ValueError, AttributeError):
                     file_id = None
                 if not file_id:
-                    sys.exit(f"ERROR: task finished but no fileId in progress: {progress}")
+                    raise RuntimeError(f"task finished but no fileId in progress: {progress}")
                 return file_id
             time.sleep(TASK_POLL_INTERVAL)
-        sys.exit(f"ERROR: Command Runner task {task_id} did not finish within {TASK_POLL_TIMEOUT}s")
+        raise RuntimeError(f"Command Runner task {task_id} did not finish within {TASK_POLL_TIMEOUT}s")
 
     # -- Step 6: fetch the raw CLI output ------------------------------------
     def get_file(self, file_id):
@@ -322,63 +325,75 @@ def main():
     batches = list(chunked(device_ids, BATCH_SIZE))
     print(f"Running '{COMMAND}' on {len(device_ids)} device(s) in {len(batches)} "
           f"batch(es) of up to {BATCH_SIZE} (Command Runner's per-request device limit)...")
-    file_results = []
-    for i, batch in enumerate(batches, 1):
-        print(f"\nBatch {i}/{len(batches)} ({len(batch)} device(s))...")
-        try:
-            task_id = run_command_with_retry(dnac, batch, COMMAND)
-        except requests.HTTPError as exc:
-            print(f"  !! Command Runner request failed for this batch: {http_error_detail(exc)}")
-            continue
-        print(f"  taskId: {task_id} - waiting for completion...")
-        file_id = dnac.wait_for_task(task_id)
-        batch_results = dnac.get_file(file_id)
-        if not batch_results:
-            print(f"  !! no content returned for this batch")
-        else:
-            file_results.extend(batch_results)
-        if i < len(batches):
-            time.sleep(BATCH_PAUSE)
-    print("\nAll batches retrieved.\n")
-
-    dns_cache = {}
-    rows = []
-    empty_devices = []
-    for entry in file_results:
-        dev_uuid = entry.get("deviceUuid")
-        source_ip, source_hostname = id_to_source.get(dev_uuid, ("?", dev_uuid or "?"))
-        command_responses = entry.get("commandResponses") or {}
-        raw = (command_responses.get("SUCCESS") or {}).get(COMMAND)
-        if not raw:
-            err = (command_responses.get("FAILURE") or {}).get(COMMAND) \
-                or (command_responses.get("BLACKLISTED") or {}).get(COMMAND) \
-                or "no output returned"
-            print(f"!! {source_hostname} ({source_ip}): {err}")
-            continue
-
-        neighbors = parse_cdp_neighbors_detail(raw)
-        if not neighbors:
-            empty_devices.append(source_hostname)
-            continue
-
-        for n in neighbors:
-            hostname = ""
-            if not args.no_dns and n["neighbor_ip"]:
-                if n["neighbor_ip"] not in dns_cache:
-                    dns_cache[n["neighbor_ip"]] = reverse_dns(n["neighbor_ip"])
-                hostname = dns_cache[n["neighbor_ip"]]
-            rows.append([source_hostname, n["neighbor_id"], n["neighbor_ip"], n["platform"], hostname])
-            print(f"{source_hostname} -> {n['neighbor_id']} ({n['neighbor_ip']}) [{n['platform']}] hostname={hostname}")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_path = os.path.join(script_dir, OUTPUT_FILE)
+    dns_cache = {}
+    row_count = 0
+    empty_devices = []
+    failed_batches = []
+
+    # Write incrementally, one batch at a time, so a crash/interrupt partway
+    # through a large run (e.g. 1770 devices = ~89 batches) still leaves a
+    # usable CSV with everything completed so far, instead of losing it all.
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Source Device", "Neighbor ID", "Neighbor IP", "Platform", "Hostname"])
-        writer.writerows(rows)
+        f.flush()
+
+        for i, batch in enumerate(batches, 1):
+            print(f"\nBatch {i}/{len(batches)} ({len(batch)} device(s))...")
+            try:
+                task_id = run_command_with_retry(dnac, batch, COMMAND)
+                print(f"  taskId: {task_id} - waiting for completion...")
+                file_id = dnac.wait_for_task(task_id)
+                batch_results = dnac.get_file(file_id)
+            except (requests.HTTPError, RuntimeError) as exc:
+                print(f"  !! batch {i} failed, skipping it and continuing: {exc}")
+                failed_batches.append(i)
+                if i < len(batches):
+                    time.sleep(BATCH_PAUSE)
+                continue
+
+            if not batch_results:
+                print(f"  !! no content returned for this batch")
+
+            for entry in batch_results or []:
+                dev_uuid = entry.get("deviceUuid")
+                source_ip, source_hostname = id_to_source.get(dev_uuid, ("?", dev_uuid or "?"))
+                command_responses = entry.get("commandResponses") or {}
+                raw = (command_responses.get("SUCCESS") or {}).get(COMMAND)
+                if not raw:
+                    err = (command_responses.get("FAILURE") or {}).get(COMMAND) \
+                        or (command_responses.get("BLACKLISTED") or {}).get(COMMAND) \
+                        or "no output returned"
+                    print(f"  !! {source_hostname} ({source_ip}): {err}")
+                    continue
+
+                neighbors = parse_cdp_neighbors_detail(raw)
+                if not neighbors:
+                    empty_devices.append(source_hostname)
+                    continue
+
+                for n in neighbors:
+                    hostname = ""
+                    if not args.no_dns and n["neighbor_ip"]:
+                        if n["neighbor_ip"] not in dns_cache:
+                            dns_cache[n["neighbor_ip"]] = reverse_dns(n["neighbor_ip"])
+                        hostname = dns_cache[n["neighbor_ip"]]
+                    writer.writerow([source_hostname, n["neighbor_id"], n["neighbor_ip"], n["platform"], hostname])
+                    row_count += 1
+                    print(f"  {source_hostname} -> {n['neighbor_id']} ({n['neighbor_ip']}) "
+                          f"[{n['platform']}] hostname={hostname}")
+            f.flush()
+
+            if i < len(batches):
+                time.sleep(BATCH_PAUSE)
 
     print("\n" + "=" * 60)
-    print(f"Wrote {len(rows)} neighbor entries to {output_path}")
+    print(f"Wrote {row_count} neighbor entries to {output_path}")
+    if failed_batches:
+        print(f"{len(failed_batches)} batch(es) failed entirely and were skipped: {failed_batches}")
     if empty_devices:
         print(f"{len(empty_devices)} device(s) had no CDP neighbors: {', '.join(empty_devices)}")
     if skipped:

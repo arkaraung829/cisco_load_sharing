@@ -235,6 +235,43 @@ def wait_for_task(api, task_id):
     sys.exit(f"ERROR: Command Runner task {task_id} did not finish within {TASK_POLL_TIMEOUT}s")
 
 
+def extract_file_content(response):
+    """The File API can return a raw download-wrapper object (Cisco's
+    DownloadResponse) instead of already-parsed JSON, since file downloads
+    can be any content type. Try the standard accessors in order and
+    json-decode whichever one yields usable text/bytes."""
+    if isinstance(response, (list, dict)):
+        return response
+
+    json_method = getattr(response, "json", None)
+    if callable(json_method):
+        try:
+            return json_method()
+        except Exception as exc:
+            debug(f"response.json() raised: {exc}")
+
+    for attr in ("data", "content", "text", "body", "raw_response"):
+        value = getattr(response, attr, None)
+        if value is None:
+            continue
+        if isinstance(value, (list, dict)):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                return json.loads(value.decode("utf-8"))
+            except Exception as exc:
+                debug(f"response.{attr} (bytes) json.loads failed: {exc}")
+        elif isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception as exc:
+                debug(f"response.{attr} (str) json.loads failed: {exc}")
+
+    debug(f"could not extract content from {type(response).__name__}; "
+          f"available attrs: {[m for m in dir(response) if not m.startswith('_')]}")
+    return []
+
+
 # -- Step 6: fetch the raw CLI output -----------------------------------------
 def get_file(api, file_id):
     method, name = resolve_method(
@@ -244,7 +281,8 @@ def get_file(api, file_id):
     debug(f"raw response from file.{name}: type={type(response).__name__} "
           f"repr={repr(response)[:1000]}")
     result = unwrap(response)
-    debug(f"after unwrap(): type={type(result).__name__} repr={repr(result)[:1000]}")
+    result = extract_file_content(result)
+    debug(f"after extract_file_content(): type={type(result).__name__} repr={repr(result)[:1000]}")
     return result
 
 

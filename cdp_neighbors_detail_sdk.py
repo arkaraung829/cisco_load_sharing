@@ -54,6 +54,8 @@ COMMAND = "show cdp neighbors detail"
 TASK_POLL_INTERVAL = 5
 TASK_POLL_TIMEOUT = 300
 DNS_TIMEOUT = 3
+BATCH_SIZE = 20    # Command Runner's documented limit: max 5 commands x 20 devices per request
+BATCH_PAUSE = 2    # seconds between batches
 OUTPUT_FILE = "cdp_neighbors_results_sdk.csv"
 
 
@@ -314,6 +316,11 @@ def reverse_dns(ip):
         return ""
 
 
+def chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 # -- Step 2: read the input file for IP addresses ----------------------------
 def read_ips(path):
     """Yield IP addresses from an .xlsx or .csv file with an 'IP Address' column."""
@@ -383,16 +390,24 @@ def main():
     device_ids = [d[1] for d in devices]
     id_to_source = {d[1]: (d[0], d[2]) for d in devices}
 
-    print(f"Running '{COMMAND}' on {len(device_ids)} device(s)...")
-    task_id = run_command(api, device_ids, COMMAND)
-    print(f"taskId: {task_id} - waiting for completion...")
-    file_id = wait_for_task(api, task_id)
-    file_results = get_file(api, file_id)
-    print("Command output retrieved.\n")
-    if not file_results:
-        print(f"!! File API returned no usable content (type={type(file_results).__name__}, "
-              f"value={file_results!r}). Re-run with CDP_SDK_DEBUG=1 set for full detail, "
-              f"e.g.:\n     set CDP_SDK_DEBUG=1  (cmd)   or   $env:CDP_SDK_DEBUG=\"1\"  (PowerShell)\n")
+    batches = list(chunked(device_ids, BATCH_SIZE))
+    print(f"Running '{COMMAND}' on {len(device_ids)} device(s) in {len(batches)} "
+          f"batch(es) of up to {BATCH_SIZE} (Command Runner's per-request device limit)...")
+    file_results = []
+    for i, batch in enumerate(batches, 1):
+        print(f"\nBatch {i}/{len(batches)} ({len(batch)} device(s))...")
+        task_id = run_command(api, batch, COMMAND)
+        print(f"  taskId: {task_id} - waiting for completion...")
+        file_id = wait_for_task(api, task_id)
+        batch_results = get_file(api, file_id)
+        if not batch_results:
+            print(f"  !! no content returned for this batch (type={type(batch_results).__name__}, "
+                  f"value={batch_results!r}). Re-run with CDP_SDK_DEBUG=1 set for full detail.")
+        else:
+            file_results.extend(batch_results)
+        if i < len(batches):
+            time.sleep(BATCH_PAUSE)
+    print("\nAll batches retrieved.\n")
 
     dns_cache = {}
     rows = []

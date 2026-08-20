@@ -53,6 +53,8 @@ RETRY_DELAY = 15         # seconds before first retry (doubles each attempt)
 TASK_POLL_INTERVAL = 5   # seconds between task-status polls
 TASK_POLL_TIMEOUT = 300  # give up polling after this many seconds
 DNS_TIMEOUT = 3          # seconds to wait for each reverse-DNS lookup
+BATCH_SIZE = 20          # Command Runner's documented limit: max 5 commands x 20 devices per request
+BATCH_PAUSE = 2          # seconds between batches
 
 OUTPUT_FILE = "cdp_neighbors_results.csv"
 
@@ -246,6 +248,11 @@ def reverse_dns(ip):
         return ""
 
 
+def chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 # -- Step 2: read the input file for IP addresses ---------------------------
 def read_ips(path):
     """Yield IP addresses from an .xlsx or .csv file with an 'IP Address' column."""
@@ -312,15 +319,27 @@ def main():
     device_ids = [d[1] for d in devices]
     id_to_source = {d[1]: (d[0], d[2]) for d in devices}
 
-    print(f"Running '{COMMAND}' on {len(device_ids)} device(s)...")
-    try:
-        task_id = run_command_with_retry(dnac, device_ids, COMMAND)
-    except requests.HTTPError as exc:
-        sys.exit(f"ERROR: Command Runner request failed: {http_error_detail(exc)}")
-    print(f"taskId: {task_id} - waiting for completion...")
-    file_id = dnac.wait_for_task(task_id)
-    file_results = dnac.get_file(file_id)
-    print("Command output retrieved.\n")
+    batches = list(chunked(device_ids, BATCH_SIZE))
+    print(f"Running '{COMMAND}' on {len(device_ids)} device(s) in {len(batches)} "
+          f"batch(es) of up to {BATCH_SIZE} (Command Runner's per-request device limit)...")
+    file_results = []
+    for i, batch in enumerate(batches, 1):
+        print(f"\nBatch {i}/{len(batches)} ({len(batch)} device(s))...")
+        try:
+            task_id = run_command_with_retry(dnac, batch, COMMAND)
+        except requests.HTTPError as exc:
+            print(f"  !! Command Runner request failed for this batch: {http_error_detail(exc)}")
+            continue
+        print(f"  taskId: {task_id} - waiting for completion...")
+        file_id = dnac.wait_for_task(task_id)
+        batch_results = dnac.get_file(file_id)
+        if not batch_results:
+            print(f"  !! no content returned for this batch")
+        else:
+            file_results.extend(batch_results)
+        if i < len(batches):
+            time.sleep(BATCH_PAUSE)
+    print("\nAll batches retrieved.\n")
 
     dns_cache = {}
     rows = []

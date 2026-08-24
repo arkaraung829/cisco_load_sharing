@@ -8,34 +8,32 @@ deliberately not implemented here.
 Reads an Excel (.xlsx) or CSV file with at least an "IP Address" column
 (any other columns, e.g. Device Family / Site, are ignored).
 
+*** Uses the legacy SWIM API, not the newer networkDeviceImages family. ***
+Both /networkDeviceImages/distribute/bulk and the per-device
+/networkDeviceImages/<id>/distribute returned HTTP 404 "BAPI not found"
+against this deployment (confirmed: Catalyst Center 2.3.7.11) - that API
+family was introduced in a later release and simply isn't registered on
+this controller. This script instead uses the classic SWIM endpoints,
+which have been stable since early DNA Center releases:
+
 Workflow (all steps automated):
-    1. Authenticate             POST /dna/system/api/v1/auth/token
+    1. Authenticate            POST /dna/system/api/v1/auth/token
     2. Read IP list from the input file
-    3. Resolve IP -> device     GET  /dna/intent/api/v1/network-device/ip-address/<ip>
-    4. Trigger ALL devices      POST /dna/intent/api/v1/networkDeviceImages/<deviceId>/distribute
-                                 one call PER device (paced with a short pause + retry/backoff),
-                                 but every device is triggered before any polling starts -
-                                 empty distributedImages -> Catalyst Center auto-selects the
-                                 image tagged Golden for that device's family/site
-    5. Poll ALL tasks together  GET  /dna/intent/api/v1/networkDeviceImageUpdates?parentId=<taskId>
-                                 one shared loop checks every device's own taskId each round,
-                                 so the actual image copies run in parallel on Catalyst
-                                 Center's side instead of one full copy at a time
-    6. Print a summary of what succeeded / failed / was skipped
+    3. Resolve IP -> device    GET  /dna/intent/api/v1/network-device/ip-address/<ip>
+    4. Resolve Golden image    GET  /dna/intent/api/v1/image/importation?family=<family>&isTaggedGolden=true
+                                per unique device family (cached - not repeated
+                                per device). The classic distribute endpoint has
+                                no auto-select behavior, so this step is required
+                                unless --image-id is given explicitly.
+    5. Trigger distribution    POST /dna/intent/api/v1/image/distribution
+                                body is an ARRAY of {deviceUuid, imageUuid} pairs -
+                                ALL devices are sent in one call (this endpoint's
+                                schema is natively bulk, unlike the newer family)
+    6. Poll the task           GET  /dna/intent/api/v1/task/<taskId>
+                                the classic task API - isError/endTime/progress
+    7. Print a summary of what succeeded / failed / was skipped
 
-Note: the bulk endpoint (/networkDeviceImages/distribute/bulk) was tried
-first but returned "BAPI not found" (HTTP 404) against this Catalyst
-Center deployment - that endpoint isn't registered on this version. Each
-device therefore gets its own taskId (no single shared task like the bulk
-endpoint would have given), which is why triggering and polling are split
-into two separate phases - triggering serially but polling everything at
-once keeps large runs (e.g. ~80 devices) from taking as long as N times a
-single device's copy time.
-
-No activation step is performed anywhere in this script. The legacy
-/dna/intent/api/v1/image/distribution endpoint is intentionally not used -
-it predates the networkDeviceImages family and lacks Golden-image
-auto-selection.
+No activation step is performed anywhere in this script.
 
 Usage:
     python distribute_golden_image.py --file devices.xlsx
@@ -66,14 +64,8 @@ COL_IP = "ip address"
 
 DISTRIBUTE_RETRIES = 3    # extra attempts when Catalyst Center returns 429/5xx
 RETRY_DELAY = 15          # seconds before first retry (doubles each attempt)
-POLL_INTERVAL = 10        # seconds between distribution-task status polls
-POLL_TIMEOUT = 1800       # give up polling after this many seconds (image copy can take a while)
-PAUSE_BETWEEN_DEVICES = 2 # seconds between per-device distribute calls
-
-SUCCESS_STATUSES = {"SUCCESS", "SUCCESS_WITH_WARNINGS", "COMPLETED"}
-FAILURE_STATUSES = {"FAILED", "FAILURE", "ERROR", "CANCELLED", "TIMEOUT"}
-# Keys Catalyst Center might use to say which device an update record is for
-DEVICE_ID_KEYS = ("networkDeviceId", "deviceId", "device_id")
+POLL_INTERVAL = 10        # seconds between task-status polls
+POLL_TIMEOUT = 3600       # give up polling after this many seconds (a large batch's image copy can take a while)
 
 
 def load_dotenv():
@@ -97,17 +89,17 @@ def load_dotenv():
 
 def parse_args():
     load_dotenv()
-    p = argparse.ArgumentParser(description="Distribute the Golden image to Catalyst Center devices in bulk (no activation).")
+    p = argparse.ArgumentParser(description="Distribute the Golden image to Catalyst Center devices (legacy SWIM API, no activation).")
     p.add_argument("--host", default=os.environ.get("DNAC_HOST"),
                    help="Catalyst Center hostname or IP, no scheme (or set DNAC_HOST)")
     p.add_argument("--file", required=True, help="Input .xlsx or .csv file with an 'IP Address' column")
     p.add_argument("--username", default=os.environ.get("DNAC_USER"), help="API username (or set DNAC_USER)")
     p.add_argument("--password", default=os.environ.get("DNAC_PASSWORD"), help="API password (or set DNAC_PASSWORD)")
     p.add_argument("--image-id", default=None,
-                   help="Optional specific software image UUID to distribute instead of "
-                        "auto-selecting each device's tagged Golden image")
+                   help="Optional specific software image UUID to distribute to every device, "
+                        "instead of looking up each device family's tagged Golden image")
     p.add_argument("--insecure", "-k", action="store_true", help="Skip TLS certificate verification (self-signed labs)")
-    p.add_argument("--dry-run", action="store_true", help="Resolve devices but do not trigger distribution")
+    p.add_argument("--dry-run", action="store_true", help="Resolve devices and Golden images but do not trigger distribution")
     args = p.parse_args()
 
     if not args.host:
@@ -162,43 +154,54 @@ class DnacClient:
         r.raise_for_status()
         return r.json().get("response") or None
 
-    # -- Step 4: trigger distribution for one device (DISTRIBUTE ONLY - never activate) --
-    def distribute_device(self, device_id, image_id=None):
-        # Empty distributedImages -> Catalyst Center auto-picks the image
-        # tagged Golden for this device's family/site (per API doc).
-        body = {"distributedImages": [{"id": image_id}]} if image_id else {}
+    # -- Step 4: family -> Golden image UUID ---------------------------------
+    def get_golden_image_id(self, family):
+        """Return the imageUuid tagged Golden for this device family, or None
+        if none is tagged. Prints the raw response since this is the call
+        we're least certain of the exact schema for."""
+        r = self.session.get(
+            f"{self.base}/dna/intent/api/v1/image/importation",
+            params={"family": family, "isTaggedGolden": "true"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        images = body.get("response") or []
+        if not images:
+            print(f"  [debug] no golden image found for family '{family}' - raw response: {body}")
+            return None
+        image = images[0]
+        image_id = image.get("imageUuid") or image.get("id")
+        if not image_id:
+            print(f"  [debug] golden image entry has no imageUuid/id field - raw entry: {image}")
+        return image_id
+
+    # -- Step 5: trigger distribution for all devices in ONE call -----------
+    # This endpoint's schema is a bare array of {deviceUuid, imageUuid} pairs,
+    # unlike the newer per-device/bulk endpoints that don't exist on this
+    # Catalyst Center version - so all devices go in a single request here.
+    def distribute_legacy(self, pairs):
         r = self.session.post(
-            f"{self.base}/dna/intent/api/v1/networkDeviceImages/{device_id}/distribute",
-            json=body,
-            timeout=60,
+            f"{self.base}/dna/intent/api/v1/image/distribution",
+            json=pairs,
+            timeout=120,
         )
         r.raise_for_status()
         return r.json()
 
-    # -- Step 5: one non-blocking check of a single task's status -----------
-    def poll_task_once(self, task_id, device_id):
-        """Check whether this device's distribute task has reached a terminal
-        status yet. Returns the status item if so, else None. Deliberately
-        does not sleep/loop itself, so a caller tracking many devices' tasks
-        (each with its own taskId, since there's no bulk endpoint here) can
-        interleave checks across all of them in one shared polling loop -
-        letting every device's image copy run in parallel on Catalyst
-        Center's side instead of waiting for each device before starting
-        the next one's copy."""
-        r = self.session.get(
-            f"{self.base}/dna/intent/api/v1/networkDeviceImageUpdates",
-            params={"parentId": task_id},
-            timeout=30,
-        )
-        r.raise_for_status()
-        payload = r.json().get("response")
-        items = payload if isinstance(payload, list) else ([payload] if payload else [])
-        for item in items:
-            dev_id = next((item[k] for k in DEVICE_ID_KEYS if k in item), None)
-            status = str(item.get("status", "")).upper()
-            if dev_id == device_id and (status in SUCCESS_STATUSES or status in FAILURE_STATUSES):
-                return item
-        return None
+    # -- Step 6: poll the classic task API -----------------------------------
+    def wait_for_task(self, task_id):
+        deadline = time.time() + POLL_TIMEOUT
+        while time.time() < deadline:
+            r = self.session.get(f"{self.base}/dna/intent/api/v1/task/{task_id}", timeout=30)
+            r.raise_for_status()
+            task = r.json().get("response") or {}
+            if task.get("isError"):
+                return {"status": "FAILED", "detail": task.get("failureReason") or str(task)}
+            if task.get("endTime"):
+                return {"status": "SUCCESS", "detail": task.get("progress") or ""}
+            time.sleep(POLL_INTERVAL)
+        return {"status": "TIMEOUT", "detail": f"no result after {POLL_TIMEOUT}s"}
 
 
 def http_error_detail(exc):
@@ -221,12 +224,12 @@ def http_error_detail(exc):
     return "; ".join(parts) or f"HTTP {resp.status_code}: {resp.text[:500]}"
 
 
-def distribute_with_retry(dnac, device_id, image_id):
-    """Trigger one device's distribute call, retrying on transient server overload."""
+def distribute_with_retry(dnac, pairs):
+    """Trigger the distribute call, retrying on transient server overload."""
     delay = RETRY_DELAY
     for attempt in range(DISTRIBUTE_RETRIES + 1):
         try:
-            return dnac.distribute_device(device_id, image_id)
+            return dnac.distribute_legacy(pairs)
         except requests.HTTPError as exc:
             resp = exc.response
             retryable = resp is not None and resp.status_code in (429, 500, 502, 503, 504)
@@ -300,80 +303,70 @@ def main():
     if not devices:
         sys.exit("ERROR: no devices resolved to inventory entries - nothing to distribute.")
 
-    if args.dry_run:
-        print(f"[dry-run] would trigger distribution for {len(devices)} device(s) "
-              f"(golden image auto-selected per device)")
-        sys.exit(0)
-
-    # Phase 1: trigger every device's distribution first (not waiting for
-    # each one to finish before starting the next) so the actual image
-    # copies run in parallel on Catalyst Center's side. Only the trigger
-    # calls themselves are sequential/paced - the copies are not.
-    print(f"Triggering distribution for {len(devices)} device(s) "
-          f"(the bulk endpoint isn't available on this Catalyst Center - see docstring)...\n")
-
-    results = {}
-    task_by_device = {}   # device_id -> taskId, only for devices that triggered OK
-    for idx, (ip, device_id, hostname, family) in enumerate(devices, 1):
-        print(f"[{idx}/{len(devices)}] triggering {ip} ({hostname})...")
-        try:
-            trigger = distribute_with_retry(dnac, device_id, args.image_id)
-        except requests.HTTPError as exc:
-            detail = http_error_detail(exc)
-            print(f"  !! distribute request failed: {detail}")
-            results[device_id] = {"status": "FAILED", "detail": detail}
-            if idx < len(devices):
-                time.sleep(PAUSE_BETWEEN_DEVICES)
+    # Resolve each unique family's Golden image once (not per device).
+    print("Resolving Golden image per device family...")
+    golden_by_family = {}
+    for family in sorted({d[3] for d in devices}):
+        if args.image_id:
+            golden_by_family[family] = args.image_id
+            print(f"  {family}: using --image-id override {args.image_id}")
             continue
-
-        task_id = (trigger.get("response") or {}).get("taskId") or trigger.get("taskId")
-        if not task_id:
-            print(f"  !! no taskId returned - raw response: {trigger}")
-            results[device_id] = {"status": "FAILED", "detail": f"no taskId in response: {trigger}"}
-            if idx < len(devices):
-                time.sleep(PAUSE_BETWEEN_DEVICES)
-            continue
-        print(f"  taskId: {task_id}")
-        task_by_device[device_id] = task_id
-        if idx < len(devices):
-            time.sleep(PAUSE_BETWEEN_DEVICES)
-
-    # Phase 2: poll every outstanding task together in one shared loop,
-    # instead of blocking on each device before triggering/checking the next.
-    if task_by_device:
-        print(f"\nAll {len(task_by_device)} distribution(s) triggered - waiting for all to finish "
-              f"(image copies run in parallel; this can take a while for large images/WAN links)...\n")
-        remaining = dict(task_by_device)
-        deadline = time.time() + POLL_TIMEOUT
-        while remaining and time.time() < deadline:
-            for device_id, task_id in list(remaining.items()):
-                item = dnac.poll_task_once(task_id, device_id)
-                if item is not None:
-                    results[device_id] = item
-                    del remaining[device_id]
-                    hostname = next(h for ip_, id_, h, f_ in devices if id_ == device_id)
-                    status = str(item.get("status", "")).upper()
-                    print(f"  {'=>' if status in SUCCESS_STATUSES else '!!'} {hostname}: {status.lower()}")
-            if remaining:
-                time.sleep(POLL_INTERVAL)
-        for device_id in remaining:
-            results[device_id] = {"status": "TIMEOUT", "detail": f"no terminal status after {POLL_TIMEOUT}s"}
+        image_id = dnac.get_golden_image_id(family)
+        golden_by_family[family] = image_id
+        print(f"  {family}: {'golden imageUuid ' + image_id if image_id else 'NO GOLDEN IMAGE FOUND'}")
     print()
 
-    ok, failed = [], []
+    pairs = []          # [{"deviceUuid":..., "imageUuid":...}, ...]
+    device_by_uuid = {}  # deviceUuid -> (ip, hostname)
     for ip, device_id, hostname, family in devices:
-        r = results.get(device_id, {"status": "UNKNOWN", "detail": "no status returned for this device"})
-        status = str(r.get("status", "")).upper()
-        detail = r.get("detail") or r.get("message") or ""
-        if status in SUCCESS_STATUSES:
-            print(f"=> {ip} ({hostname}): {status.lower()} {detail}")
-            ok.append((ip, hostname))
-        else:
-            print(f"!! {ip} ({hostname}): {status or 'UNKNOWN'} {detail}")
-            failed.append((ip, hostname, detail or str(r)))
+        image_id = golden_by_family.get(family)
+        if not image_id:
+            print(f"!! {ip} ({hostname}): no Golden image for family '{family}' - skipping")
+            skipped.append((ip, f"no Golden image tagged for family '{family}'"))
+            continue
+        pairs.append({"deviceUuid": device_id, "imageUuid": image_id})
+        device_by_uuid[device_id] = (ip, hostname)
 
-    # -- Step 6: summary -------------------------------------------------------
-    print("=" * 60)
+    if not pairs:
+        sys.exit("ERROR: no device/image pairs resolved - nothing to distribute.")
+
+    if args.dry_run:
+        print(f"[dry-run] would trigger distribution for {len(pairs)} device(s):")
+        for p in pairs:
+            ip, hostname = device_by_uuid[p["deviceUuid"]]
+            print(f"  {ip} ({hostname}) -> image {p['imageUuid']}")
+        sys.exit(0)
+
+    print(f"Triggering distribution for {len(pairs)} device(s) in one request...")
+    try:
+        trigger = distribute_with_retry(dnac, pairs)
+    except requests.HTTPError as exc:
+        sys.exit(f"ERROR: distribute request failed: {http_error_detail(exc)}")
+    print(f"  raw trigger response: {trigger}")
+
+    task_id = (trigger.get("response") or {}).get("taskId") or trigger.get("taskId")
+    if not task_id:
+        sys.exit(f"ERROR: no taskId returned - raw response: {trigger}")
+    print(f"\ntaskId: {task_id} - polling until the batch finishes "
+          f"(image copies happen together; this can take a while)...\n")
+
+    result = dnac.wait_for_task(task_id)
+    status = result["status"]
+    detail = result["detail"]
+
+    # This classic API returns one task for the whole batch, not clean
+    # per-device granularity - so every device in this run shares the same
+    # outcome unless/until we see the real response and can refine this.
+    ok, failed = [], []
+    if status == "SUCCESS":
+        print(f"=> batch distribution {status.lower()}: {detail}")
+        ok = list(device_by_uuid.values())
+    else:
+        print(f"!! batch distribution {status.lower()}: {detail}")
+        failed = [(ip, hostname, detail) for ip, hostname in device_by_uuid.values()]
+
+    # -- Step 7: summary -------------------------------------------------------
+    print("\n" + "=" * 60)
     print(f"Summary: {len(ok)} distributed, {len(failed)} failed, {len(skipped)} skipped")
     for ip, hostname, reason in failed:
         print(f"  FAILED  {ip} ({hostname}): {reason}")

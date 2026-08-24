@@ -226,7 +226,9 @@ class DnacClient:
 
     # -- Step 6: poll the classic task API -----------------------------------
     def wait_for_task(self, task_id):
-        deadline = time.time() + POLL_TIMEOUT
+        start = time.time()
+        deadline = start + POLL_TIMEOUT
+        last_heartbeat = start
         while time.time() < deadline:
             r = self.session.get(f"{self.base}/dna/intent/api/v1/task/{task_id}", timeout=30)
             r.raise_for_status()
@@ -235,6 +237,10 @@ class DnacClient:
                 return {"status": "FAILED", "detail": task.get("failureReason") or str(task)}
             if task.get("endTime"):
                 return {"status": "SUCCESS", "detail": task.get("progress") or ""}
+            if time.time() - last_heartbeat >= 60:
+                elapsed = int(time.time() - start)
+                print(f"  .. still waiting ({elapsed}s elapsed) - task progress so far: {task.get('progress') or 'n/a'}")
+                last_heartbeat = time.time()
             time.sleep(POLL_INTERVAL)
         return {"status": "TIMEOUT", "detail": f"no result after {POLL_TIMEOUT}s"}
 

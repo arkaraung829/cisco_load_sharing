@@ -168,7 +168,22 @@ class DnacClient:
         body = r.json()
         images = body.get("response") or []
         if not images:
-            print(f"  [debug] no golden image found for family '{family}' - raw response: {body}")
+            print(f"  [debug] no golden image found filtering by family='{family}' - "
+                  f"the SWIM image catalog's 'family' field may use a different value "
+                  f"than the device inventory's broad category. Listing ALL golden-tagged "
+                  f"images so we can see the real field values:")
+            r2 = self.session.get(
+                f"{self.base}/dna/intent/api/v1/image/importation",
+                params={"isTaggedGolden": "true"},
+                timeout=30,
+            )
+            r2.raise_for_status()
+            all_golden = r2.json().get("response") or []
+            if not all_golden:
+                print(f"  [debug] no golden-tagged images exist at all in this Catalyst Center "
+                      f"- someone needs to tag an image Golden first (Design > Image Repository)")
+            for img in all_golden:
+                print(f"  [debug] golden image: {img}")
             return None
         image = images[0]
         image_id = image.get("imageUuid") or image.get("id")

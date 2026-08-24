@@ -157,39 +157,59 @@ class DnacClient:
     # -- Step 4: family -> Golden image UUID ---------------------------------
     def get_golden_image_id(self, family):
         """Return the imageUuid tagged Golden for this device family, or None
-        if none is tagged. Prints the raw response since this is the call
-        we're least certain of the exact schema for."""
+        if none can be safely determined.
+
+        The device inventory's broad family ('Switches and Hubs') is not the
+        same value SWIM's own catalog uses internally (e.g. 'CAT9K_LITE'), so
+        the direct filtered lookup usually misses. Fall back to every image
+        tagged Golden system-wide: if there's exactly one, it's unambiguous
+        regardless of what its family field says, so use it. If there are
+        several and none match by family, refuse to guess - list them so the
+        run can be pointed at the right one via --image-id instead of
+        silently picking (possibly the wrong) one.
+        """
         r = self.session.get(
             f"{self.base}/dna/intent/api/v1/image/importation",
             params={"family": family, "isTaggedGolden": "true"},
             timeout=30,
         )
         r.raise_for_status()
-        body = r.json()
-        images = body.get("response") or []
-        if not images:
-            print(f"  [debug] no golden image found filtering by family='{family}' - "
-                  f"the SWIM image catalog's 'family' field may use a different value "
-                  f"than the device inventory's broad category. Listing ALL golden-tagged "
-                  f"images so we can see the real field values:")
-            r2 = self.session.get(
-                f"{self.base}/dna/intent/api/v1/image/importation",
-                params={"isTaggedGolden": "true"},
-                timeout=30,
-            )
-            r2.raise_for_status()
-            all_golden = r2.json().get("response") or []
-            if not all_golden:
-                print(f"  [debug] no golden-tagged images exist at all in this Catalyst Center "
-                      f"- someone needs to tag an image Golden first (Design > Image Repository)")
-            for img in all_golden:
-                print(f"  [debug] golden image: {img}")
-            return None
-        image = images[0]
-        image_id = image.get("imageUuid") or image.get("id")
-        if not image_id:
+        images = r.json().get("response") or []
+        if images:
+            image = images[0]
+            image_id = image.get("imageUuid") or image.get("id")
+            if image_id:
+                return image_id
             print(f"  [debug] golden image entry has no imageUuid/id field - raw entry: {image}")
-        return image_id
+
+        r2 = self.session.get(
+            f"{self.base}/dna/intent/api/v1/image/importation",
+            params={"isTaggedGolden": "true"},
+            timeout=30,
+        )
+        r2.raise_for_status()
+        all_golden = r2.json().get("response") or []
+
+        if not all_golden:
+            print(f"  [debug] no golden-tagged images exist at all in this Catalyst Center "
+                  f"- someone needs to tag an image Golden first (Design > Image Repository)")
+            return None
+
+        if len(all_golden) == 1:
+            image = all_golden[0]
+            image_id = image.get("imageUuid") or image.get("id")
+            print(f"  [debug] exactly one Golden image exists system-wide "
+                  f"(family='{image.get('family')}', version={image.get('displayVersion')}) "
+                  f"- using it for family '{family}' unambiguously")
+            return image_id
+
+        print(f"  [debug] {len(all_golden)} Golden images exist and none match family='{family}' "
+              f"- can't safely auto-select. Candidates:")
+        for img in all_golden:
+            print(f"  [debug]   imageUuid={img.get('imageUuid')} family={img.get('family')} "
+                  f"version={img.get('displayVersion')}")
+        print(f"  [debug] use --image-id to pin one explicitly for this run")
+        return None
 
     # -- Step 5: trigger distribution for all devices in ONE call -----------
     # This endpoint's schema is a bare array of {deviceUuid, imageUuid} pairs,

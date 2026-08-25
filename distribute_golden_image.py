@@ -98,6 +98,12 @@ def parse_args():
     p.add_argument("--image-id", default=None,
                    help="Optional specific software image UUID to distribute to every device, "
                         "instead of looking up each device family's tagged Golden image")
+    p.add_argument("--task-name", default=None,
+                   help="Optional label sent with each device/image pair, in case Catalyst "
+                        "Center's Image Update Status page picks it up as the Task Name "
+                        "(the documented request schema doesn't list this field, so it's "
+                        "sent speculatively - check the Task Name column after a run to "
+                        "see whether it actually took effect)")
     p.add_argument("--insecure", "-k", action="store_true", help="Skip TLS certificate verification (self-signed labs)")
     p.add_argument("--dry-run", action="store_true", help="Resolve devices and Golden images but do not trigger distribution")
     args = p.parse_args()
@@ -365,14 +371,18 @@ def main():
             print(f"!! {ip} ({hostname}): no Golden image for family '{family}' - skipping")
             skipped.append((ip, f"no Golden image tagged for family '{family}'"))
             continue
-        pairs.append({"deviceUuid": device_id, "imageUuid": image_id})
+        pair = {"deviceUuid": device_id, "imageUuid": image_id}
+        if args.task_name:
+            pair["name"] = args.task_name
+        pairs.append(pair)
         device_by_uuid[device_id] = (ip, hostname)
 
     if not pairs:
         sys.exit("ERROR: no device/image pairs resolved - nothing to distribute.")
 
     if args.dry_run:
-        print(f"[dry-run] would trigger distribution for {len(pairs)} device(s):")
+        print(f"[dry-run] would trigger distribution for {len(pairs)} device(s)"
+              f"{f' (task-name: {args.task_name})' if args.task_name else ''}:")
         for p in pairs:
             ip, hostname = device_by_uuid[p["deviceUuid"]]
             print(f"  {ip} ({hostname}) -> image {p['imageUuid']}")

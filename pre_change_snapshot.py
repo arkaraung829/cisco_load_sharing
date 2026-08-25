@@ -385,27 +385,19 @@ def main():
     device_ids = [d[1] for d in devices]
     id_to_source = {d[1]: (d[0], d[2]) for d in devices}
 
-    # snapshots[deviceUuid][command] = output text (or an "[ERROR: ...]" marker)
-    snapshots = {d: {} for d in device_ids}
-
-    for cmd_idx, command in enumerate(COMMANDS, 1):
-        print(f"[{cmd_idx}/{len(COMMANDS)}] Running '{command}' on {len(device_ids)} device(s)...")
-        results, errors = run_command_on_batches(api, device_ids, command)
-        for d in device_ids:
-            if results.get(d):
-                snapshots[d][command] = results[d]
-            else:
-                snapshots[d][command] = f"[ERROR: {errors.get(d, 'no output returned')}]"
-                ip, hostname = id_to_source[d]
-                print(f"  !! {hostname} ({ip}): {errors.get(d, 'no output returned')}")
-        print()
-
+    # Create every device's file up front and write its header immediately,
+    # then append each command's section as soon as that command finishes
+    # for ALL devices - so a run interrupted partway through (network blip,
+    # Ctrl+C, closed terminal) still leaves every file with whatever
+    # commands completed before the interruption, instead of losing
+    # everything (which is what happened when files were only written once
+    # at the very end, after all 6 commands x all devices finished).
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(script_dir, OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    written = []
+    file_paths = {}   # deviceUuid -> path
     for d in device_ids:
         ip, hostname = id_to_source[d]
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", hostname or ip)
@@ -415,15 +407,26 @@ def main():
             f.write(f"Device: {hostname} ({ip})\n")
             f.write(f"Snapshot taken: {datetime.datetime.now().isoformat()}\n")
             f.write(f"{'=' * 70}\n\n")
-            for command in COMMANDS:
+        file_paths[d] = out_path
+    print(f"Created {len(file_paths)} snapshot file(s) in {output_dir}\n")
+
+    for cmd_idx, command in enumerate(COMMANDS, 1):
+        print(f"[{cmd_idx}/{len(COMMANDS)}] Running '{command}' on {len(device_ids)} device(s)...")
+        results, errors = run_command_on_batches(api, device_ids, command)
+        for d in device_ids:
+            output = results.get(d)
+            if not output:
+                output = f"[ERROR: {errors.get(d, 'no output returned')}]"
+                ip, hostname = id_to_source[d]
+                print(f"  !! {hostname} ({ip}): {errors.get(d, 'no output returned')}")
+            with open(file_paths[d], "a") as f:
                 f.write(f"##### {command} #####\n")
-                f.write(snapshots[d].get(command, "[ERROR: no data collected]"))
+                f.write(output)
                 f.write("\n\n")
-        written.append(out_path)
-        print(f"Wrote {out_path}")
+        print()
 
     print("\n" + "=" * 60)
-    print(f"Summary: {len(written)} device snapshot(s) written to {output_dir}")
+    print(f"Summary: {len(file_paths)} device snapshot(s) written to {output_dir}")
     if skipped:
         print(f"{len(skipped)} IP(s) skipped (not in inventory): {', '.join(skipped)}")
 

@@ -1,42 +1,48 @@
 #!/usr/bin/env python3
 """
-Add a list of devices (by IP) to an EXISTING Catalyst Center tag, for
-scoping a specific change (e.g. "these 80 switches are part of change
-CHANGE-2026-08-25-1234"). Create the tag itself manually first (Provision
-> Tag, or Design > Tag) - this script only populates membership, since
-that's the tedious/error-prone-by-hand part for a large device list.
-Remove the tag (or its membership) manually once the change is done,
-per your own plan.
+Add or remove a list of devices (by IP) from an EXISTING Catalyst Center
+tag, for scoping a specific change (e.g. "these 80 switches are part of
+change CHANGE-2026-08-25-1234"). Create the tag itself manually first
+(Provision > Tag, or Design > Tag) - this script only populates/clears
+membership, since that's the tedious/error-prone-by-hand part for a large
+device list.
 
-Deliberately NOT implemented (schemas not confirmed, low priority given
+Deliberately NOT implemented (schema not confirmed, low priority given
 your stated workflow):
-    - Creating the tag itself (Create Tag)
-    - Deleting the tag or removing membership (Delete Tag / Remove Tag member)
-If you want these automated later, paste their schema docs the same way
-you did for 'Update tag membership' and I'll add them precisely.
+    - Creating or deleting the tag itself (Create Tag / Delete Tag)
+If you want this automated later, paste its schema doc the same way you
+did for the membership operations and I'll add it precisely.
 
 'memberType="networkdevice"' is confirmed correct - verified live against
 GET /dna/intent/api/v1/tag/member/type (--list-member-types reproduces
-this check). A real run initially failed with "One or more member ids
-does not exist" despite that; the actual bug was memberToTags being
+this check). A real add-run initially failed with "One or more member
+ids does not exist" despite that; the actual bug was memberToTags being
 built backwards ({tagId: [deviceIds]} instead of {deviceId: [tagId]} -
 the field name reads "member to tags", i.e. keyed by member, not by
 tag), which made Catalyst Center look up the tag's own UUID as if it
 were a device id. Fixed - see add_devices_to_tag().
 
-Workflow:
+Workflow (add, the default):
     1. Authenticate                POST /dna/system/api/v1/auth/token
     2. Read IP list from the input file
     3. Resolve IP -> device        GET  /dna/intent/api/v1/network-device/ip-address/<ip>
     4. Resolve tag name -> tag id  GET  /dna/intent/api/v1/tag?name=<name>
     5. Add all devices to the tag  PUT  /dna/intent/api/v1/tag/member
                                     body: {"memberType": "networkdevice",
-                                           "memberToTags": {"<tagId>": [deviceIds...]}}
+                                           "memberToTags": {"<deviceId>": [tagId], ...}}
     6. Print a summary
+
+Workflow (--remove):
+    Same steps 1-4, then for EACH device individually (this endpoint has
+    no bulk form, unlike the add operation):
+    5. Remove from the tag  DELETE /dna/intent/api/v1/tag/<tagId>/member/<deviceId>
+    6. Print a per-device summary (this endpoint gives real per-device
+       success/failure, unlike the single shared trigger the add path uses)
 
 Usage:
     python tag_devices_for_change.py --file devices.csv --tag-name CHANGE-2026-08-25-1234 --dry-run
     python tag_devices_for_change.py --file devices.csv --tag-name CHANGE-2026-08-25-1234 --insecure
+    python tag_devices_for_change.py --file devices.csv --tag-name CHANGE-2026-08-25-1234 --insecure --remove
 
 Credentials and host are taken from (highest priority first):
     1. command-line flags --host / --username / --password
@@ -61,6 +67,7 @@ COL_IP = "ip address"
 MEMBER_TYPE = "networkdevice"  # best-effort guess - see docstring
 TASK_POLL_INTERVAL = 5
 TASK_POLL_TIMEOUT = 120
+REMOVE_PAUSE = 1   # seconds between per-device removal calls
 
 
 def load_dotenv():
@@ -92,7 +99,9 @@ def parse_args():
     p.add_argument("--username", default=os.environ.get("DNAC_USER"), help="API username (or set DNAC_USER)")
     p.add_argument("--password", default=os.environ.get("DNAC_PASSWORD"), help="API password (or set DNAC_PASSWORD)")
     p.add_argument("--insecure", "-k", action="store_true", help="Skip TLS certificate verification (self-signed labs)")
-    p.add_argument("--dry-run", action="store_true", help="Resolve devices and the tag but do not add anyone to it")
+    p.add_argument("--dry-run", action="store_true", help="Resolve devices and the tag but do not change membership")
+    p.add_argument("--remove", action="store_true",
+                   help="Remove the devices from the tag instead of adding them")
     p.add_argument("--list-member-types", action="store_true",
                    help="Print the real valid memberType values from GET /tag/member/type, then exit")
     args = p.parse_args()
@@ -184,6 +193,17 @@ class DnacClient:
             f"{self.base}/dna/intent/api/v1/tag/member",
             json=body,
             timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    # -- (--remove) remove one device from the tag ---------------------------
+    def remove_device_from_tag(self, tag_id, device_id):
+        # No request body for this one - just path parameters, and it's
+        # scoped to a single member per call (no bulk form like the add).
+        r = self.session.delete(
+            f"{self.base}/dna/intent/api/v1/tag/{tag_id}/member/{device_id}",
+            timeout=30,
         )
         r.raise_for_status()
         return r.json()
@@ -297,12 +317,40 @@ def main():
         sys.exit("ERROR: no devices resolved to inventory entries - nothing to tag.")
 
     device_ids = [d[1] for d in devices]
+    action = "remove" if args.remove else "add"
 
     if args.dry_run:
-        print(f"[dry-run] would add {len(device_ids)} device(s) to tag '{args.tag_name}' ({tag_id}):")
+        print(f"[dry-run] would {action} {len(device_ids)} device(s) "
+              f"{'from' if args.remove else 'to'} tag '{args.tag_name}' ({tag_id}):")
         for ip, device_id, hostname in devices:
             print(f"  {ip} ({hostname})")
         sys.exit(0)
+
+    if args.remove:
+        print(f"Removing {len(device_ids)} device(s) from tag '{args.tag_name}', one at a time "
+              f"(this endpoint has no bulk form)...\n")
+        ok, failed = [], []
+        for idx, (ip, device_id, hostname) in enumerate(devices, 1):
+            print(f"[{idx}/{len(devices)}] {ip} ({hostname})...")
+            try:
+                result = dnac.remove_device_from_tag(tag_id, device_id)
+                print(f"  raw response: {result}")
+                ok.append((ip, hostname))
+            except requests.HTTPError as exc:
+                detail = http_error_detail(exc)
+                print(f"  !! remove failed: {detail}")
+                failed.append((ip, hostname, detail))
+            if idx < len(devices):
+                time.sleep(REMOVE_PAUSE)
+
+        print("\n" + "=" * 60)
+        print(f"Summary: {len(ok)} device(s) removed from tag '{args.tag_name}', "
+              f"{len(failed)} failed, {len(skipped)} skipped")
+        for ip, hostname, reason in failed:
+            print(f"  FAILED  {ip} ({hostname}): {reason}")
+        for ip, reason in skipped:
+            print(f"  SKIPPED {ip}: {reason}")
+        sys.exit(1 if failed else 0)
 
     print(f"Adding {len(device_ids)} device(s) to tag '{args.tag_name}'...")
     try:

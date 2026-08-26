@@ -50,12 +50,15 @@ import getpass
 import os
 import re
 import sys
+import time
 
 import requests
 import urllib3
 
 COL_IP = "ip address"
 MEMBER_TYPE = "networkdevice"  # best-effort guess - see docstring
+TASK_POLL_INTERVAL = 5
+TASK_POLL_TIMEOUT = 120
 
 
 def load_dotenv():
@@ -167,6 +170,20 @@ class DnacClient:
         r.raise_for_status()
         return r.json()
 
+    # -- Step 6: poll the classic task API to confirm the add actually worked --
+    def wait_for_task(self, task_id):
+        deadline = time.time() + TASK_POLL_TIMEOUT
+        while time.time() < deadline:
+            r = self.session.get(f"{self.base}/dna/intent/api/v1/task/{task_id}", timeout=30)
+            r.raise_for_status()
+            task = r.json().get("response") or {}
+            if task.get("isError"):
+                return {"status": "FAILED", "detail": task.get("failureReason") or str(task)}
+            if task.get("endTime"):
+                return {"status": "SUCCESS", "detail": task.get("progress") or ""}
+            time.sleep(TASK_POLL_INTERVAL)
+        return {"status": "TIMEOUT", "detail": f"no result after {TASK_POLL_TIMEOUT}s"}
+
 
 def http_error_detail(exc):
     """Pull the human-readable error out of a Catalyst Center error response."""
@@ -271,12 +288,29 @@ def main():
         sys.exit(f"ERROR: add-to-tag request failed: {http_error_detail(exc)}\n"
                  f"(memberType='{MEMBER_TYPE}' is a best-effort guess - if this error suggests an "
                  f"invalid memberType, check GET /dna/intent/api/v1/tag/member/type for the real value.)")
-    print(f"  raw response: {result}")
+    print(f"  raw trigger response: {result}")
+
+    task_id = (result.get("response") or {}).get("taskId") or result.get("taskId")
+    if not task_id:
+        sys.exit(f"ERROR: no taskId returned - raw response: {result}")
+    print(f"  taskId: {task_id} - polling to confirm it actually succeeded...")
+
+    task_result = dnac.wait_for_task(task_id)
+    status = task_result["status"]
+    detail = task_result["detail"]
 
     print("\n" + "=" * 60)
-    print(f"Summary: {len(devices)} device(s) added to tag '{args.tag_name}', {len(skipped)} skipped")
+    if status == "SUCCESS":
+        print(f"=> tag membership update {status.lower()}: {detail}")
+        print(f"Summary: {len(devices)} device(s) added to tag '{args.tag_name}', {len(skipped)} skipped")
+    else:
+        print(f"!! tag membership update {status.lower()}: {detail}")
+        print(f"(memberType='{MEMBER_TYPE}' is a best-effort guess - if this failure suggests an "
+              f"invalid memberType, check GET /dna/intent/api/v1/tag/member/type for the real value.)")
+        print(f"Summary: 0 device(s) confirmed added to tag '{args.tag_name}', {len(skipped)} skipped")
     for ip, reason in skipped:
         print(f"  SKIPPED {ip}: {reason}")
+    sys.exit(1 if status != "SUCCESS" else 0)
 
 
 if __name__ == "__main__":

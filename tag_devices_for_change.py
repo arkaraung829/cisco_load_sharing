@@ -15,12 +15,14 @@ your stated workflow):
 If you want these automated later, paste their schema docs the same way
 you did for 'Update tag membership' and I'll add them precisely.
 
-One field is a best-effort guess, not confirmed: 'memberType' is sent as
-"networkdevice" - the API doc says valid values are queryable via
-GET /dna/intent/api/v1/tag/member/type, which hasn't been checked yet.
-This is low-risk to get wrong (the call just errors, no device is
-touched), but if it fails, run --dry-run to confirm the rest works, then
-share the actual error and I'll adjust the value.
+'memberType="networkdevice"' is confirmed correct - verified live against
+GET /dna/intent/api/v1/tag/member/type (--list-member-types reproduces
+this check). A real run initially failed with "One or more member ids
+does not exist" despite that; the actual bug was memberToTags being
+built backwards ({tagId: [deviceIds]} instead of {deviceId: [tagId]} -
+the field name reads "member to tags", i.e. keyed by member, not by
+tag), which made Catalyst Center look up the tag's own UUID as if it
+were a device id. Fixed - see add_devices_to_tag().
 
 Workflow:
     1. Authenticate                POST /dna/system/api/v1/auth/token
@@ -172,7 +174,12 @@ class DnacClient:
 
     # -- Step 5: add devices to the tag ---------------------------------------
     def add_devices_to_tag(self, tag_id, device_ids):
-        body = {"memberType": MEMBER_TYPE, "memberToTags": {tag_id: device_ids}}
+        # memberToTags maps MEMBER id -> list of TAG ids (the field name reads
+        # "member to tags"), not the other way around. Getting this backwards
+        # ({tagId: [deviceIds]}) makes Catalyst Center look up the tag's own
+        # UUID as if it were a device id, producing "member ids does not
+        # exist" even though memberType and the device ids were both fine.
+        body = {"memberType": MEMBER_TYPE, "memberToTags": {device_id: [tag_id] for device_id in device_ids}}
         r = self.session.put(
             f"{self.base}/dna/intent/api/v1/tag/member",
             json=body,
@@ -301,9 +308,7 @@ def main():
     try:
         result = dnac.add_devices_to_tag(tag_id, device_ids)
     except requests.HTTPError as exc:
-        sys.exit(f"ERROR: add-to-tag request failed: {http_error_detail(exc)}\n"
-                 f"(memberType='{MEMBER_TYPE}' is a best-effort guess - if this error suggests an "
-                 f"invalid memberType, check GET /dna/intent/api/v1/tag/member/type for the real value.)")
+        sys.exit(f"ERROR: add-to-tag request failed: {http_error_detail(exc)}")
     print(f"  raw trigger response: {result}")
 
     task_id = (result.get("response") or {}).get("taskId") or result.get("taskId")
@@ -321,8 +326,6 @@ def main():
         print(f"Summary: {len(devices)} device(s) added to tag '{args.tag_name}', {len(skipped)} skipped")
     else:
         print(f"!! tag membership update {status.lower()}: {detail}")
-        print(f"(memberType='{MEMBER_TYPE}' is a best-effort guess - if this failure suggests an "
-              f"invalid memberType, check GET /dna/intent/api/v1/tag/member/type for the real value.)")
         print(f"Summary: 0 device(s) confirmed added to tag '{args.tag_name}', {len(skipped)} skipped")
     for ip, reason in skipped:
         print(f"  SKIPPED {ip}: {reason}")

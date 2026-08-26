@@ -85,12 +85,14 @@ def parse_args():
     p = argparse.ArgumentParser(description="Add devices to an existing Catalyst Center tag, by IP.")
     p.add_argument("--host", default=os.environ.get("DNAC_HOST"),
                    help="Catalyst Center hostname or IP, no scheme (or set DNAC_HOST)")
-    p.add_argument("--file", required=True, help="Input .xlsx or .csv file with an 'IP Address' column")
-    p.add_argument("--tag-name", required=True, help="Name of the EXISTING tag to add devices to (create it first via the GUI)")
+    p.add_argument("--file", help="Input .xlsx or .csv file with an 'IP Address' column (not needed with --list-member-types)")
+    p.add_argument("--tag-name", help="Name of the EXISTING tag to add devices to (not needed with --list-member-types)")
     p.add_argument("--username", default=os.environ.get("DNAC_USER"), help="API username (or set DNAC_USER)")
     p.add_argument("--password", default=os.environ.get("DNAC_PASSWORD"), help="API password (or set DNAC_PASSWORD)")
     p.add_argument("--insecure", "-k", action="store_true", help="Skip TLS certificate verification (self-signed labs)")
     p.add_argument("--dry-run", action="store_true", help="Resolve devices and the tag but do not add anyone to it")
+    p.add_argument("--list-member-types", action="store_true",
+                   help="Print the real valid memberType values from GET /tag/member/type, then exit")
     args = p.parse_args()
 
     if not args.host:
@@ -99,6 +101,8 @@ def parse_args():
         args.username = input("Catalyst Center username: ")
     if not args.password:
         args.password = getpass.getpass("Catalyst Center password: ")
+    if not args.list_member_types and not (args.file and args.tag_name):
+        sys.exit("ERROR: --file and --tag-name are required unless --list-member-types is used")
     return args
 
 
@@ -158,6 +162,13 @@ class DnacClient:
         if not tags:
             return None
         return tags[0].get("id")
+
+    def get_member_types(self):
+        """Return the raw list of valid memberType values, per the doc's own
+        pointer ('queryable via GET /tag/member/type')."""
+        r = self.session.get(f"{self.base}/dna/intent/api/v1/tag/member/type", timeout=30)
+        r.raise_for_status()
+        return r.json().get("response") or r.json()
 
     # -- Step 5: add devices to the tag ---------------------------------------
     def add_devices_to_tag(self, tag_id, device_ids):
@@ -242,14 +253,19 @@ def read_ips(path):
 def main():
     args = parse_args()
 
+    print(f"Connecting to https://{normalize_host(args.host)} ...")
+    dnac = DnacClient(args.host, args.username, args.password, verify=not args.insecure)
+    print("Authenticated OK\n")
+
+    if args.list_member_types:
+        print("Real valid memberType values from GET /dna/intent/api/v1/tag/member/type:")
+        print(dnac.get_member_types())
+        return
+
     ips = list(read_ips(args.file))
     if not ips:
         sys.exit(f"ERROR: no usable rows found in {args.file}")
     print(f"Loaded {len(ips)} device IP(s) from {args.file}\n")
-
-    print(f"Connecting to https://{normalize_host(args.host)} ...")
-    dnac = DnacClient(args.host, args.username, args.password, verify=not args.insecure)
-    print("Authenticated OK\n")
 
     tag_id = dnac.get_tag_id(args.tag_name)
     if not tag_id:
